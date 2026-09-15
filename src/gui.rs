@@ -1,0 +1,204 @@
+/*-----------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the project root for license information.
+ *----------------------------------------------------------------------------------------*/
+
+use std::sync::mpsc::Sender;
+use std::{mem, ptr};
+use crate::strings::to_utf16;
+use windows_sys::core::PCWSTR;
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+
+// Custom message types for progress window communication
+const WM_UPDATE_STATUS: u32 = 0x0400 + 1; // WM_USER + 1
+
+unsafe extern "system" {
+	pub fn ShutdownBlockReasonCreate(hWnd: HWND, pwszReason: PCWSTR) -> BOOL;
+	pub fn ShutdownBlockReasonDestroy(hWnd: HWND) -> BOOL;
+}
+
+struct DialogData {
+	silent: bool,
+	tx: Sender<ProgressWindow>,
+	label: String,
+}
+
+static mut DIALOG_HWND: HWND = 0;
+
+unsafe extern "system" fn dlgproc(hwnd: HWND, msg: u32, _: WPARAM, l: LPARAM) -> isize {
+	use crate::resources;
+	use windows_sys::Win32::Foundation::RECT;
+	use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		EndDialog, GetDesktopWindow, GetWindowRect, SendDlgItemMessageW, SetDlgItemTextW,
+		SetWindowPos, HWND_TOPMOST, WM_DESTROY, WM_INITDIALOG, WM_USER,
+	};
+
+	unsafe {
+		match msg {
+			WM_INITDIALOG => {
+				let data = &*(l as *const DialogData);
+				if !data.silent {
+					SendDlgItemMessageW(hwnd, resources::PROGRESS_SLIDER, WM_USER + 10, 1, 0);
+
+					// change the text of the dialog label
+					let updating_text: Vec<u16> = to_utf16(&data.label);
+					SetDlgItemTextW(hwnd, -1, updating_text.as_ptr());
+
+					let mut rect = RECT {
+						top: 0,
+						left: 0,
+						bottom: 0,
+						right: 0,
+					};
+					GetWindowRect(hwnd, &mut rect);
+
+					let width = rect.right - rect.left;
+					let height = rect.bottom - rect.top;
+
+					GetWindowRect(GetDesktopWindow(), &mut rect);
+
+					SetWindowPos(
+						hwnd,
+						HWND_TOPMOST,
+						rect.right / 2 - width / 2,
+						rect.bottom / 2 - height / 2,
+						width,
+						height,
+						0,
+					);
+				} else {
+					EndDialog(hwnd, 0);
+				}
+
+				// Store dialog handle for status updates
+				DIALOG_HWND = hwnd;
+
+				data.tx
+					.send(ProgressWindow {
+						ui_thread_id: GetCurrentThreadId(),
+					})
+					.unwrap();
+
+				let shutdown_reason = to_utf16(&format!("{} is updating...", env!("INNO_UPDATER_PRODUCT_NAME")));
+				ShutdownBlockReasonCreate(hwnd, shutdown_reason.as_ptr());
+				0
+			}
+			WM_UPDATE_STATUS => {
+				if l != 0 {
+					SetDlgItemTextW(hwnd, -1, l as *const u16);
+				}
+				0
+			}
+			WM_DESTROY => {
+				ShutdownBlockReasonDestroy(hwnd);
+				DIALOG_HWND = 0;
+				0
+			}
+			_ => 0,
+		}
+	}
+}
+
+pub struct ProgressWindow {
+	ui_thread_id: u32,
+}
+
+impl ProgressWindow {
+	pub fn exit(&self) {
+		use windows_sys::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+
+		unsafe {
+			PostThreadMessageW(self.ui_thread_id, WM_QUIT, 0, 0);
+		}
+	}
+
+	pub fn update_status(&self, status: &str) {
+		use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+		let status_utf16 = to_utf16(status);
+		unsafe {
+			if DIALOG_HWND != 0 {
+				SendMessageW(
+					DIALOG_HWND,
+					WM_UPDATE_STATUS,
+					0,
+					status_utf16.as_ptr() as LPARAM
+				);
+			}
+		}
+	}
+}
+
+pub fn run_progress_window(silent: bool, tx: Sender<ProgressWindow>, label: String) {
+	use crate::resources;
+	use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+	use windows_sys::Win32::UI::WindowsAndMessaging::DialogBoxParamW;
+
+	let data = DialogData { silent, tx, label };
+
+	unsafe {
+		DialogBoxParamW(
+			GetModuleHandleW(ptr::null_mut()),
+			resources::PROGRESS_DIALOG as PCWSTR,
+			mem::zeroed(),
+			Some(dlgproc),
+			(&data as *const DialogData) as LPARAM,
+		);
+	}
+}
+
+pub enum MessageBoxType {
+	Error,
+	RetryCancel,
+}
+
+#[derive(Debug)]
+pub enum MessageBoxResult {
+	Unknown,
+	Abort,
+	Cancel,
+	Continue,
+	Ignore,
+	No,
+	OK,
+	Retry,
+	TryAgain,
+	Yes,
+}
+
+pub fn message_box(text: &str, caption: &str, mbtype: MessageBoxType) -> MessageBoxResult {
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		MessageBoxW, IDABORT, IDCANCEL, IDCONTINUE, IDIGNORE, IDNO, IDOK, IDRETRY, IDTRYAGAIN,
+		IDYES, MB_ICONERROR, MB_RETRYCANCEL, MB_SYSTEMMODAL,
+	};
+
+	let result: i32;
+
+	let text_wide = to_utf16(text);
+	let caption_wide = to_utf16(caption);
+
+	unsafe {
+		result = MessageBoxW(
+			mem::zeroed(),
+			text_wide.as_ptr(),
+			caption_wide.as_ptr(),
+			match mbtype {
+				MessageBoxType::Error => MB_ICONERROR | MB_SYSTEMMODAL,
+				MessageBoxType::RetryCancel => MB_RETRYCANCEL | MB_ICONERROR | MB_SYSTEMMODAL,
+			},
+		)
+	}
+
+	match result {
+		IDABORT => MessageBoxResult::Abort,
+		IDCANCEL => MessageBoxResult::Cancel,
+		IDCONTINUE => MessageBoxResult::Continue,
+		IDIGNORE => MessageBoxResult::Ignore,
+		IDNO => MessageBoxResult::No,
+		IDOK => MessageBoxResult::OK,
+		IDRETRY => MessageBoxResult::Retry,
+		IDTRYAGAIN => MessageBoxResult::TryAgain,
+		IDYES => MessageBoxResult::Yes,
+		_ => MessageBoxResult::Unknown,
+	}
+}

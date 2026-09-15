@@ -1,0 +1,88 @@
+name: Build
+
+# Inno Setup is 32-bit, so the helper it launches must be i686 -- matching the binary
+# shipped by upstream (PE machine 0x014c).
+#
+# This runs in CI rather than on a developer machine because Smart App Control, when
+# Enforced, refuses to execute Cargo's freshly-compiled unsigned build scripts ("An
+# Application Control policy has blocked this file", os error 4551), and the only local
+# remedy is turning SAC off -- which cannot be undone without reinstalling Windows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_name:
+        description: 'Product name compiled into the binary'
+        required: true
+        default: 'EditVolt'
+      company_name:
+        description: 'Company name in the version resource'
+        required: true
+        default: 'Editvolt.com'
+      release_tag:
+        description: 'Publish a release under this tag (blank = artifact only)'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      INNO_UPDATER_PRODUCT_NAME: ${{ github.event.inputs.product_name || 'EditVolt' }}
+      INNO_UPDATER_COMPANY_NAME: ${{ github.event.inputs.company_name || 'Editvolt.com' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup target add i686-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target i686-pc-windows-msvc --bin inno_updater
+
+      - name: Verify the branding landed in the binary
+        shell: bash
+        run: |
+          EXE=target/i686-pc-windows-msvc/release/inno_updater.exe
+          test -f "$EXE" || { echo "no binary produced"; exit 1; }
+          # A parameter that silently failed to apply is the one failure that would ship
+          # looking correct, so assert on the bytes rather than trusting the build.
+          if grep -aq "Visual Studio Code" "$EXE"; then
+            echo "FAIL: upstream branding survived into the binary"; exit 1
+          fi
+          grep -aq "$INNO_UPDATER_PRODUCT_NAME" "$EXE" || {
+            echo "FAIL: '$INNO_UPDATER_PRODUCT_NAME' not found in the binary"; exit 1; }
+          sha256sum "$EXE" | awk '{print $1}' > inno_updater.exe.sha256
+          echo "sha256: $(cat inno_updater.exe.sha256)"
+          cp "$EXE" ./inno_updater.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inno_updater-i686
+          path: |
+            inno_updater.exe
+            inno_updater.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ github.event.inputs.release_tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.event.inputs.release_tag }}" \
+            inno_updater.exe inno_updater.exe.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ github.event.inputs.release_tag }}" \
+            --notes "i686 build of the branding-parameterized fork.
+
+          Product name: \`$INNO_UPDATER_PRODUCT_NAME\`
+          sha256: \`$(cat inno_updater.exe.sha256)\`
+          Upstream: microsoft/inno-updater 0.24.0 (MIT)"
