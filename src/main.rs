@@ -551,6 +551,29 @@ fn update(
 		info!(log, "Update completed successfully");
 	} else {
 		info!(log, "New executable not found: {:?}, using traditional update method", new_exe_path);
+
+		// WAIT FOR THE APPLICATION TO EXIT BEFORE TOUCHING ITS FILES.
+		//
+		// The staged path above already does this (see the wait_or_kill call after the
+		// three-way rename). The traditional path did not, so it went straight to opening
+		// handles on the installed executable -- and if the application had not finished
+		// exiting, every attempt failed with "The process cannot access the file because it
+		// is being used by another process", 16 retries at a time, behind a Retry/Cancel
+		// dialog the user could do nothing useful with.
+		//
+		// This path is reached whenever the installer did not stage a new_<exe> -- i.e.
+		// whenever `win32VersionedUpdate` is off, which is the default for every code-oss
+		// build. Only Microsoft's official build sets it, so upstream rarely exercises this
+		// branch while a rebranded editor exercises it every single update.
+		//
+		// This is not a new mechanism: it is the same call the other branch makes, and it is
+		// a no-op when the application has genuinely exited (capture returns no processes,
+		// and wait_or_kill returns immediately on an empty list). It only does anything in
+		// the case that was previously a guaranteed failure.
+		window.update_status("Waiting for the application to close...");
+		let running_processes = process::capture_running_processes(log, code_path)?;
+		process::wait_or_kill(log, &running_processes)?;
+
 		// Fall back to the original update method if no new executable is found
 		do_update(log, code_path, update_folder_name)?;
 	}

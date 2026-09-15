@@ -59,6 +59,11 @@ jobs:
           fi
           grep -aq "$INNO_UPDATER_PRODUCT_NAME" "$EXE" || {
             echo "FAIL: '$INNO_UPDATER_PRODUCT_NAME' not found in the binary"; exit 1; }
+          # The traditional update path must wait for the app to exit before touching its
+          # files. This status string only exists on that code path, so its presence is the
+          # cheap proof the fix shipped rather than being optimized or edited away.
+          grep -aq "Waiting for the application to close" "$EXE" || {
+            echo "FAIL: the traditional-path process wait is missing from the binary"; exit 1; }
           sha256sum "$EXE" | awk '{print $1}' > inno_updater.exe.sha256
           echo "sha256: $(cat inno_updater.exe.sha256)"
           cp "$EXE" ./inno_updater.exe
