@@ -10,6 +10,10 @@ use crate::strings::to_u16s;
 use crate::util;
 use windows_sys::Win32::Foundation::HANDLE;
 
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+
 pub struct FileHandle(HANDLE);
 
 impl FileHandle {
@@ -69,26 +73,27 @@ impl FileHandle {
 	}
 
 	fn set_disposition_posix(&self) -> Result<(), Box<dyn error::Error>> {
+		self.set_disposition_ex(
+			FILE_DISPOSITION_FLAG_DELETE
+				| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+				| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+		)
+	}
+
+	fn set_disposition_ex(&self, flags: u32) -> Result<(), Box<dyn error::Error>> {
 		use std::mem;
 		use windows_sys::Win32::Storage::FileSystem::{
 			FileDispositionInfoEx, SetFileInformationByHandle,
 		};
 
-		// windows-sys 0.42 exposes the info class but not the struct or its flags.
+		// windows-sys 0.42 exposes the info class but not the struct.
 		#[repr(C)]
 		struct FileDispositionInfoExData {
 			flags: u32,
 		}
-		const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
-		const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
-		const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
 
 		unsafe {
-			let mut info = FileDispositionInfoExData {
-				flags: FILE_DISPOSITION_FLAG_DELETE
-					| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-					| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-			};
+			let mut info = FileDispositionInfoExData { flags };
 			let result = SetFileInformationByHandle(
 				self.0,
 				FileDispositionInfoEx,
@@ -189,6 +194,29 @@ mod tests {
 		let scanner = fs::File::open(&path).unwrap();
 
 		let handle = FileHandle::new(&path).expect("opening must not require exclusive access");
+
+		// Report which combination the OS accepts, so a failure here says why rather
+		// than only that the name survived.
+		let mut report = String::new();
+		for (label, flags) in [
+			("DELETE", FILE_DISPOSITION_FLAG_DELETE),
+			(
+				"DELETE|POSIX",
+				FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+			),
+			(
+				"DELETE|POSIX|IGNORE_READONLY",
+				FILE_DISPOSITION_FLAG_DELETE
+					| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+					| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+			),
+		] {
+			match handle.set_disposition_ex(flags) {
+				Ok(()) => report.push_str(&format!("  {label}: ok, exists={}\n", path.exists())),
+				Err(err) => report.push_str(&format!("  {label}: {err}\n")),
+			}
+		}
+
 		handle
 			.mark_for_deletion()
 			.expect("marking for deletion must work while another handle is open");
@@ -198,7 +226,7 @@ mod tests {
 		// entry would fail that rename.
 		assert!(
 			!path.exists(),
-			"the name must be unlinked while another handle is still open"
+			"the name must be unlinked while another handle is still open\n{report}"
 		);
 
 		handle.close().unwrap();
