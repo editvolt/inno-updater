@@ -477,26 +477,35 @@ mod tests {
 	/// aborted the entire update. The walk only matches on file NAME, so it routinely
 	/// meets processes that are not ours and that we have no right to inspect.
 	///
-	/// `svchost.exe` reproduces it without any setup: dozens of instances, all owned by
-	/// SYSTEM, none of them openable from a normal user token. Before the fix this
-	/// returned Err; it must now return an empty capture and let the update proceed.
+	/// `csrss.exe` reproduces it with no setup and nothing capturable: it is a PROTECTED
+	/// process, so OpenProcess is refused even to an administrator, and there are always
+	/// at least two instances. Before the fix, walking that name returned Err.
+	///
+	/// DO NOT call `wait_or_kill` here, or on any capture of a system process. Capture is
+	/// read-only, but wait_or_kill waits 30s and then TERMINATES what it holds. An earlier
+	/// version of this test used `svchost.exe` and did exactly that -- and because CI
+	/// runners are administrators, OpenProcess succeeded, so it captured live service
+	/// processes and began killing them; the job hung rather than failed. Terminating
+	/// csrss would be worse still: it bugchecks the machine.
 	#[test]
 	fn capture_skips_processes_it_cannot_query() {
 		let log = setup_test_logger();
-		let system_path = PathBuf::from(r"C:\Windows\System32\svchost.exe");
+		let protected_path = PathBuf::from(r"C:\Windows\System32\csrss.exe");
 
 		let running = get_running_processes().expect("snapshot must work");
 		assert!(
-			running.iter().any(|p| p.name.eq_ignore_ascii_case("svchost.exe")),
-			"expected svchost.exe in the process list; the test cannot prove anything without it"
+			running.iter().any(|p| p.name.eq_ignore_ascii_case("csrss.exe")),
+			"expected csrss.exe in the process list; the test cannot prove anything without it"
 		);
 
-		let captured = capture_running_processes(&log, &system_path)
+		// The whole point: Ok, not Err. That is the regression this pins.
+		let captured = capture_running_processes(&log, &protected_path)
 			.expect("a process we cannot query must be skipped, not abort the update");
 
-		// Whatever it captures, it must not have failed. We hold no handles we could
-		// terminate, so wait_or_kill over the result must also be a no-op.
-		assert!(wait_or_kill(&log, &captured).is_ok());
+		assert!(
+			captured.is_empty(),
+			"csrss is protected from every caller, so nothing should have been capturable"
+		);
 	}
 
 	#[test]
