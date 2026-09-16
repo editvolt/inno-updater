@@ -16,15 +16,24 @@ impl FileHandle {
 	pub fn new(path: &Path) -> Result<FileHandle, Box<dyn error::Error>> {
 		use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 		use windows_sys::Win32::Storage::FileSystem::{
-			CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+			CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+			FILE_SHARE_WRITE, OPEN_EXISTING,
 		};
 
 		unsafe {
 			let path_wide = to_u16s(path.as_os_str());
+			// The only thing this handle is ever used for is DELETE. Asking for it with
+			// dwShareMode = 0 asks for much more than that: it fails unless NO other
+			// process holds ANY handle on the file. An antivirus service keeping a
+			// read handle on the main executable is enough, and that is not a state the
+			// updater can wait out -- it is not our process and it does not have to let
+			// go. Sharing the file costs nothing here and removes a whole class of
+			// update failure that presents as "used by another process (os error 32)"
+			// after every one of the application's own processes has already exited.
 			let handle = CreateFileW(
 				path_wide.as_ptr(),
 				DELETE,
-				0,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				ptr::null_mut(),
 				OPEN_EXISTING,
 				FILE_ATTRIBUTE_NORMAL,
@@ -40,6 +49,69 @@ impl FileHandle {
 	}
 
 	pub fn mark_for_deletion(&self) -> Result<(), Box<dyn error::Error>> {
+		// Unlink the NAME now, rather than when the last handle closes.
+		//
+		// The legacy disposition only schedules the delete: the directory entry stays
+		// behind in a delete-pending state until every handle on the file is closed, and
+		// the caller does not own all of them -- a scanner can be holding one. Every open
+		// of a delete-pending name fails, so the entry blocks the very rename the updater
+		// performs next to move the new version into place.
+		//
+		// POSIX semantics remove the entry immediately and let the remaining handles keep
+		// reading the now-nameless file until they close on their own. That is exactly
+		// what this code path wants. It needs Windows 10 1709+ on NTFS, so an older system
+		// or another filesystem falls back to the legacy behaviour, which is no worse than
+		// what shipped before.
+		match self.set_disposition_posix() {
+			Ok(()) => Ok(()),
+			Err(_) => self.set_disposition_legacy(),
+		}
+	}
+
+	fn set_disposition_posix(&self) -> Result<(), Box<dyn error::Error>> {
+		use std::mem;
+		use windows_sys::Win32::Storage::FileSystem::{
+			FileDispositionInfoEx, SetFileInformationByHandle,
+		};
+
+		// windows-sys 0.42 exposes the info class but not the struct or its flags.
+		#[repr(C)]
+		struct FileDispositionInfoExData {
+			flags: u32,
+		}
+		const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+		const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+		const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+
+		unsafe {
+			let mut info = FileDispositionInfoExData {
+				flags: FILE_DISPOSITION_FLAG_DELETE
+					| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+					| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+			};
+			let result = SetFileInformationByHandle(
+				self.0,
+				FileDispositionInfoEx,
+				&mut info as *mut _ as *mut c_void,
+				mem::size_of::<FileDispositionInfoExData>() as u32,
+			);
+
+			if result == 0 {
+				return Err(io::Error::new(
+					io::ErrorKind::Other,
+					format!(
+						"Failed to unlink file: {}",
+						util::get_last_error_message()?
+					),
+				)
+				.into());
+			}
+		}
+
+		Ok(())
+	}
+
+	fn set_disposition_legacy(&self) -> Result<(), Box<dyn error::Error>> {
 		use std::mem;
 		use windows_sys::Win32::Foundation::BOOLEAN;
 		use windows_sys::Win32::Storage::FileSystem::{
@@ -57,7 +129,10 @@ impl FileHandle {
 				mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
 			);
 
-			if result.is_negative() {
+			// SetFileInformationByHandle returns BOOL, whose failure value is 0 and
+			// never negative, so the `is_negative()` check this replaces could not
+			// fire: a failed disposition was reported to the caller as success.
+			if result == 0 {
 				return Err(io::Error::new(
 					io::ErrorKind::Other,
 					format!(
@@ -89,5 +164,57 @@ impl FileHandle {
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::fs;
+
+	/// Regression: every background update failed with "The process cannot access the
+	/// file because it is being used by another process. (os error 32)" on the main
+	/// executable, minutes after all of the application's own processes had exited. The
+	/// holder was an antivirus service, and an exclusive open cannot wait that out.
+	///
+	/// No antivirus is needed to reproduce it: before the fix, ANY second handle on the
+	/// file was enough. `fs::File::open` shares read, write and delete, which is how a
+	/// well-behaved scanner holds a file.
+	#[test]
+	fn deletes_a_file_another_process_holds_open() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("held.exe");
+		fs::write(&path, b"payload").unwrap();
+
+		let scanner = fs::File::open(&path).unwrap();
+
+		let handle = FileHandle::new(&path).expect("opening must not require exclusive access");
+		handle
+			.mark_for_deletion()
+			.expect("marking for deletion must work while another handle is open");
+
+		// The name has to be gone NOW, not when the scanner lets go: the updater renames
+		// the new version onto this path as its very next step, and a delete-pending
+		// entry would fail that rename.
+		assert!(
+			!path.exists(),
+			"the name must be unlinked while another handle is still open"
+		);
+
+		handle.close().unwrap();
+		drop(scanner);
+	}
+
+	#[test]
+	fn deletes_a_file_nobody_holds_open() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("free.exe");
+		fs::write(&path, b"payload").unwrap();
+
+		let handle = FileHandle::new(&path).unwrap();
+		handle.mark_for_deletion().unwrap();
+		handle.close().unwrap();
+
+		assert!(!path.exists(), "the file must be gone");
 	}
 }
