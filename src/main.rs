@@ -103,29 +103,29 @@ fn write_file(
 /// a handle on it. (A DIRECTORY cannot be renamed that way -- Windows refuses while
 /// anything inside is open -- which is why this recurses instead.)
 fn move_into_place(log: &slog::Logger, src: &Path, dst: &Path) -> Result<(), Box<dyn error::Error>> {
-	if !dst.exists() {
-		fs::rename(src, dst)?;
+	// The name is free: delete_existing_version renamed every old entry aside before
+	// scheduling its deletion, precisely so this rename can succeed.
+	if fs::rename(src, dst).is_ok() {
 		return Ok(());
 	}
 
+	// The expected reason to be here: `dst` is a directory that could not be emptied,
+	// because a holder left a delete-pending husk inside it. The husk occupies no name the
+	// new version wants, so merge into the directory rather than demanding it be gone.
+	//
+	// Failing here instead would destroy the installation: by this point every old file
+	// has already been marked for deletion, so there is no version left to fall back to.
 	if src.is_dir() && dst.is_dir() {
 		info!(log, "{:?} survived deletion; merging into it", dst);
 		for entry in fs::read_dir(src)? {
 			let entry = entry?;
 			move_into_place(log, &entry.path(), &dst.join(entry.file_name()))?;
 		}
-		// Best effort: the source should be empty now, but a leftover here is harmless.
 		let _ = fs::remove_dir(src);
 		return Ok(());
 	}
 
-	// A file whose name is still taken, because its delete is pending behind someone
-	// else's handle. Freeing the name is exactly what rename_aside is for.
-	info!(log, "{:?} is still present; freeing the name", dst);
-	let handle = FileHandle::new(dst)?;
-	handle.rename_aside()?;
-	handle.mark_for_deletion()?;
-	handle.close()?;
+	// Anything else is a real failure; redo the rename so the caller sees why.
 	fs::rename(src, dst)?;
 	Ok(())
 }
@@ -214,27 +214,26 @@ fn delete_existing_version(
 	info!(log, "Collected all directories and file handles");
 
 	for file_handle in &file_handles {
-		// Free the NAME, but ONLY for files sitting directly in the installation root.
+		// Free the NAME before scheduling the delete, for EVERY file.
 		//
-		// A delete only lands when the LAST handle on the file closes, and we do not own
-		// all of them, so a held file keeps its directory entry in a delete-pending state
-		// where nothing can take that name. For a root-level file -- the main executable
-		// above all -- that blocks the rename which moves the new version into place, so
-		// the name has to be freed here.
+		// Measured, because two earlier attempts guessed wrong. Once a file is marked for
+		// deletion while someone else still holds it, its entry survives in a
+		// delete-pending state and that name is finished: it cannot be reopened
+		// (ACCESS_DENIED), it cannot be taken by a new file (ERROR_ALREADY_EXISTS), and it
+		// keeps its directory unremovable. `exists()` even reports false for it, which
+		// makes the state easy to misread.
 		//
-		// Files INSIDE a subdirectory need none of this: the whole subdirectory is removed
-		// below and recreated from the update folder, so their individual names never have
-		// to be reused. Renaming them is not merely unnecessary, it is harmful -- renaming
-		// an executable makes a real-time virus scanner treat it as a new file and open it
-		// to scan. Doing that to every file in the installation handed the scanner ~1800
-		// fresh reasons to hold something, and the leftovers it held then blocked the
-		// directory removal below. Measured: rg.exe and two llama-server.exe survived that
-		// way and failed the update.
-		let in_root = file_handle.path().parent() == Some(root_path);
-		if in_root {
-			if let Err(err) = file_handle.rename_aside() {
-				warn!(log, "{}", err);
-			}
+		// Renaming the entry aside first is the only thing that frees the name, and it
+		// works while the file is held. The husk keeps the delete disposition and vanishes
+		// when the holder finally lets go.
+		//
+		// This must cover files inside subdirectories too, not just the installation root.
+		// Restricting it to the root looked like a way to stop provoking virus scanners --
+		// renaming an executable makes a scanner reopen it -- but it leaves every held file
+		// in a subdirectory holding a name the new version needs. The provocation is
+		// harmless; an unusable name is not.
+		if let Err(err) = file_handle.rename_aside() {
+			warn!(log, "{}", err);
 		}
 
 		util::retry(
