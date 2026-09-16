@@ -174,13 +174,27 @@ fn delete_existing_version(
 	info!(log, "Collected all directories and file handles");
 
 	for file_handle in &file_handles {
-		// Free the NAME first. The deletion below only lands when the LAST handle on the
-		// file closes, and we do not own all of them, so without this the entry can sit
-		// in the directory in a delete-pending state -- blocking the rename that moves
-		// the new version into that exact name. Best effort: a file nobody else is
-		// holding is deleted correctly either way.
-		if let Err(err) = file_handle.rename_aside() {
-			warn!(log, "{}", err);
+		// Free the NAME, but ONLY for files sitting directly in the installation root.
+		//
+		// A delete only lands when the LAST handle on the file closes, and we do not own
+		// all of them, so a held file keeps its directory entry in a delete-pending state
+		// where nothing can take that name. For a root-level file -- the main executable
+		// above all -- that blocks the rename which moves the new version into place, so
+		// the name has to be freed here.
+		//
+		// Files INSIDE a subdirectory need none of this: the whole subdirectory is removed
+		// below and recreated from the update folder, so their individual names never have
+		// to be reused. Renaming them is not merely unnecessary, it is harmful -- renaming
+		// an executable makes a real-time virus scanner treat it as a new file and open it
+		// to scan. Doing that to every file in the installation handed the scanner ~1800
+		// fresh reasons to hold something, and the leftovers it held then blocked the
+		// directory removal below. Measured: rg.exe and two llama-server.exe survived that
+		// way and failed the update.
+		let in_root = file_handle.path().parent() == Some(root_path);
+		if in_root {
+			if let Err(err) = file_handle.rename_aside() {
+				warn!(log, "{}", err);
+			}
 		}
 
 		util::retry(
@@ -204,7 +218,7 @@ fn delete_existing_version(
 
 	for dir in top_directories {
 		let msg = format!("Deleting a directory: {:?}", dir);
-		util::retry(
+		let removed = util::retry(
 			&msg,
 			|attempt| -> Result<(), Box<dyn error::Error>> {
 				if !dir.exists() {
@@ -219,8 +233,40 @@ fn delete_existing_version(
 				fs::remove_dir_all(&dir)?;
 				Ok(())
 			},
-			None,
-		)?;
+			Some(8),
+		);
+
+		if removed.is_ok() {
+			continue;
+		}
+
+		// The directory could not be emptied, which in practice means something else is
+		// holding a file inside it -- a scanner, an indexer -- and that file is sitting
+		// delete-pending. We cannot make the holder let go.
+		//
+		// What matters is the NAME, not the bytes: the update folder is about to move a
+		// directory of the same name into this spot. Renaming works where deleting does
+		// not, because it needs no handle on the files within, so take the name and leave
+		// the husk for the next update to sweep.
+		//
+		// This is the difference between an update that survives and an installation that
+		// is destroyed. By this point every file has already been marked for deletion, so
+		// failing here leaves NEITHER the old version nor the new one -- which is exactly
+		// what happened when a scanner held three executables during a live 0.4.10 ->
+		// 0.4.11 update, and the user was left with no application at all.
+		let aside = dir.with_file_name(format!(
+			"{}.deleting-{}",
+			dir.file_name().and_then(|n| n.to_str()).unwrap_or("dir"),
+			std::process::id()
+		));
+		warn!(
+			log,
+			"Could not empty {:?} ({}). Renaming it to {:?} so the name is free; the leftover is swept by the next update.",
+			dir,
+			removed.unwrap_err(),
+			aside
+		);
+		fs::rename(&dir, &aside)?;
 	}
 
 	Ok(())

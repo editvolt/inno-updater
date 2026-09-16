@@ -238,6 +238,40 @@ mod tests {
 		drop(scanner);
 	}
 
+	/// The whole directory fallback rests on this being true: a directory can be RENAMED
+	/// while a file inside it is still open, even though it cannot be REMOVED.
+	///
+	/// This is what saves an update when a scanner is holding something. By the time the
+	/// old installation's directories are removed, every file has already been marked for
+	/// deletion -- so a failure there leaves neither the old version nor the new one. That
+	/// is not hypothetical: a live 0.4.10 -> 0.4.11 update failed exactly this way, with a
+	/// scanner holding three executables, and left the machine with no application.
+	#[test]
+	fn a_directory_renames_while_a_file_inside_it_is_held() {
+		let dir = tempfile::tempdir().unwrap();
+		let sub = dir.path().join("resources");
+		fs::create_dir(&sub).unwrap();
+		let inner = sub.join("held.exe");
+		fs::write(&inner, b"payload").unwrap();
+
+		// A scanner's handle: shares read, write and delete, like std does.
+		let scanner = fs::File::open(&inner).unwrap();
+
+		let aside = dir.path().join("resources.deleting-1234");
+		fs::rename(&sub, &aside)
+			.expect("a directory must be renameable while a file inside it is open");
+
+		assert!(!sub.exists(), "the original name must be free for the new version");
+		assert!(
+			dir.path().join("resources").parent().is_some(),
+			"and the parent must still be usable"
+		);
+		// The name is free, so the update can put the new directory here.
+		fs::create_dir(&sub).expect("the freed name must be reusable immediately");
+
+		drop(scanner);
+	}
+
 	/// The ordinary case: nobody else has the file, so it goes away completely.
 	#[test]
 	fn deletes_a_file_nobody_holds_open() {
