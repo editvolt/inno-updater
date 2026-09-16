@@ -226,15 +226,24 @@ fn capture_process(
 				return Ok(None);
 			}
 
-			return Err(io::Error::new(
-				io::ErrorKind::Other,
-				format!(
-					"Failed to open process {}: {}",
-					process.id,
-					last_error_message()
-				),
-			)
-			.into());
+			// A process we cannot open is a process we cannot identify, so we skip it --
+			// we do not abort the update over it. This only matches on file NAME so far;
+			// the thing that shares our executable's name may not be ours at all, and
+			// "Access is denied" is the ordinary answer for anything at a higher
+			// integrity level or owned by another user.
+			//
+			// This is not theoretical: a live update failed with
+			//   ERRO Failed to get process 7724 file name: Access is denied.
+			// and that one line ended the whole update. Skipping is safe because this
+			// walk is belt-and-braces -- the installer has already confirmed via its own
+			// mutex that the application is not running before it invokes us.
+			warn!(
+				log,
+				"Skipping pid {}: could not open it ({}). Not aborting the update.",
+				process.id,
+				last_error_message()
+			);
+			return Ok(None);
 		}
 
 		let mut raw_path = [0u16; MAX_PATH as usize];
@@ -251,15 +260,14 @@ fn capture_process(
 				return Ok(None);
 			}
 
-			return Err(io::Error::new(
-				io::ErrorKind::Other,
-				format!(
-					"Failed to get process {} file name: {}",
-					process.id,
-					message
-				),
-			)
-			.into());
+			// Same reasoning as the open failure above: unidentifiable is not fatal.
+			warn!(
+				log,
+				"Skipping pid {}: could not read its path ({}). Not aborting the update.",
+				process.id,
+				message
+			);
+			return Ok(None);
 		}
 
 		let process_path = PathBuf::from(from_utf16(&raw_path[0..len])?);
@@ -461,6 +469,34 @@ mod tests {
 			thread::sleep(Duration::from_millis(10));
 		}
 		false
+	}
+
+	/// Regression: a live update died on one line --
+	///   ERRO Failed to get process 7724 file name: Access is denied.
+	/// -- because a process that could not be opened or queried returned Err, and that
+	/// aborted the entire update. The walk only matches on file NAME, so it routinely
+	/// meets processes that are not ours and that we have no right to inspect.
+	///
+	/// `svchost.exe` reproduces it without any setup: dozens of instances, all owned by
+	/// SYSTEM, none of them openable from a normal user token. Before the fix this
+	/// returned Err; it must now return an empty capture and let the update proceed.
+	#[test]
+	fn capture_skips_processes_it_cannot_query() {
+		let log = setup_test_logger();
+		let system_path = PathBuf::from(r"C:\Windows\System32\svchost.exe");
+
+		let running = get_running_processes().expect("snapshot must work");
+		assert!(
+			running.iter().any(|p| p.name.eq_ignore_ascii_case("svchost.exe")),
+			"expected svchost.exe in the process list; the test cannot prove anything without it"
+		);
+
+		let captured = capture_running_processes(&log, &system_path)
+			.expect("a process we cannot query must be skipped, not abort the update");
+
+		// Whatever it captures, it must not have failed. We hold no handles we could
+		// terminate, so wait_or_kill over the result must also be a no-op.
+		assert!(wait_or_kill(&log, &captured).is_ok());
 	}
 
 	#[test]
