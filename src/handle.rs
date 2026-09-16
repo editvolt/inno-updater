@@ -195,8 +195,9 @@ mod tests {
 
 		let handle = FileHandle::new(&path).expect("opening must not require exclusive access");
 
-		// Report which combination the OS accepts, so a failure here says why rather
-		// than only that the name survived.
+		// A fresh file and a fresh handle per combination: once a disposition is set on a
+		// handle, a later call on the SAME handle may be a no-op, which would report a
+		// working flag as broken (and the reverse).
 		let mut report = String::new();
 		for (label, flags) in [
 			("DELETE", FILE_DISPOSITION_FLAG_DELETE),
@@ -211,10 +212,19 @@ mod tests {
 					| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
 			),
 		] {
-			match handle.set_disposition_ex(flags) {
-				Ok(()) => report.push_str(&format!("  {label}: ok, exists={}\n", path.exists())),
+			let probe_path = dir.path().join(format!("probe_{flags}.exe"));
+			fs::write(&probe_path, b"payload").unwrap();
+			let probe_scanner = fs::File::open(&probe_path).unwrap();
+			let probe = FileHandle::new(&probe_path).unwrap();
+			match probe.set_disposition_ex(flags) {
+				Ok(()) => report.push_str(&format!(
+					"  {label}: ok, name gone while held = {}\n",
+					!probe_path.exists()
+				)),
 				Err(err) => report.push_str(&format!("  {label}: {err}\n")),
 			}
+			probe.close().unwrap();
+			drop(probe_scanner);
 		}
 
 		handle
