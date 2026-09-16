@@ -238,16 +238,17 @@ mod tests {
 		drop(scanner);
 	}
 
-	/// The whole directory fallback rests on this being true: a directory can be RENAMED
-	/// while a file inside it is still open, even though it cannot be REMOVED.
+	/// A per-FILE rename frees a name even while the file is held. A per-DIRECTORY rename
+	/// does NOT: Windows walks the whole subtree and refuses with ACCESS_DENIED if anything
+	/// inside is open.
 	///
-	/// This is what saves an update when a scanner is holding something. By the time the
-	/// old installation's directories are removed, every file has already been marked for
-	/// deletion -- so a failure there leaves neither the old version nor the new one. That
-	/// is not hypothetical: a live 0.4.10 -> 0.4.11 update failed exactly this way, with a
-	/// scanner holding three executables, and left the machine with no application.
+	/// This is pinned because a fix was written on the opposite assumption -- that a
+	/// directory could be renamed aside when it could not be emptied -- and this test is
+	/// what caught it. The consequence matters: by the time the old installation's
+	/// directories are removed, every file has already been marked for deletion, so there
+	/// is no safe way to fail at that point. The name has to be freed file by file.
 	#[test]
-	fn a_directory_renames_while_a_file_inside_it_is_held() {
+	fn a_directory_cannot_be_renamed_while_a_file_inside_it_is_held() {
 		let dir = tempfile::tempdir().unwrap();
 		let sub = dir.path().join("resources");
 		fs::create_dir(&sub).unwrap();
@@ -258,16 +259,21 @@ mod tests {
 		let scanner = fs::File::open(&inner).unwrap();
 
 		let aside = dir.path().join("resources.deleting-1234");
-		fs::rename(&sub, &aside)
-			.expect("a directory must be renameable while a file inside it is open");
-
-		assert!(!sub.exists(), "the original name must be free for the new version");
-		assert!(
-			dir.path().join("resources").parent().is_some(),
-			"and the parent must still be usable"
+		let err = fs::rename(&sub, &aside)
+			.expect_err("renaming a directory with an open file inside must be refused");
+		assert_eq!(
+			err.kind(),
+			io::ErrorKind::PermissionDenied,
+			"expected ACCESS_DENIED, got {err:?}"
 		);
-		// The name is free, so the update can put the new directory here.
-		fs::create_dir(&sub).expect("the freed name must be reusable immediately");
+
+		// The per-FILE rename is the primitive that does work, and is what the updater
+		// relies on: it frees the name with the file still open.
+		let handle = FileHandle::new(&inner).unwrap();
+		handle.rename_aside().expect("a held FILE can still be renamed aside");
+		handle.mark_for_deletion().unwrap();
+		handle.close().unwrap();
+		assert!(!inner.exists(), "the file's name is free even though it is held");
 
 		drop(scanner);
 	}

@@ -90,6 +90,46 @@ fn write_file(
 	Ok(())
 }
 
+/// Move `src` to `dst`, coping with a `dst` that is still there.
+///
+/// The happy path is a plain rename into a free name. It is not always free: if a scanner
+/// was holding a file, `delete_existing_version` could not empty the directory containing
+/// it and left the husk behind. Requiring the name in that case is what turned a failed
+/// update into a destroyed installation -- every file has already been marked for deletion
+/// by then, so there is no old version left to fall back to.
+///
+/// So a surviving directory is merged into rather than replaced, and a surviving FILE has
+/// its name freed the one way that works while it is held: rename the entry aside through
+/// a handle on it. (A DIRECTORY cannot be renamed that way -- Windows refuses while
+/// anything inside is open -- which is why this recurses instead.)
+fn move_into_place(log: &slog::Logger, src: &Path, dst: &Path) -> Result<(), Box<dyn error::Error>> {
+	if !dst.exists() {
+		fs::rename(src, dst)?;
+		return Ok(());
+	}
+
+	if src.is_dir() && dst.is_dir() {
+		info!(log, "{:?} survived deletion; merging into it", dst);
+		for entry in fs::read_dir(src)? {
+			let entry = entry?;
+			move_into_place(log, &entry.path(), &dst.join(entry.file_name()))?;
+		}
+		// Best effort: the source should be empty now, but a leftover here is harmless.
+		let _ = fs::remove_dir(src);
+		return Ok(());
+	}
+
+	// A file whose name is still taken, because its delete is pending behind someone
+	// else's handle. Freeing the name is exactly what rename_aside is for.
+	info!(log, "{:?} is still present; freeing the name", dst);
+	let handle = FileHandle::new(dst)?;
+	handle.rename_aside()?;
+	handle.mark_for_deletion()?;
+	handle.close()?;
+	fs::rename(src, dst)?;
+	Ok(())
+}
+
 fn delete_existing_version(
 	log: &slog::Logger,
 	root_path: &Path,
@@ -236,37 +276,27 @@ fn delete_existing_version(
 			Some(8),
 		);
 
-		if removed.is_ok() {
-			continue;
+		if removed.is_err() {
+			// The directory could not be emptied, which means something else is holding a
+			// file inside it -- a scanner, an indexer -- and that file is delete-pending.
+			// We cannot make the holder let go.
+			//
+			// Renaming the directory aside does NOT work: Windows walks the subtree and
+			// refuses with ACCESS_DENIED while anything inside is open. (Pinned by
+			// handle::tests::a_directory_cannot_be_renamed_while_a_file_inside_it_is_held.)
+			//
+			// So the husk stays, and move_update merges the new version INTO it rather
+			// than requiring the name. Not fatal: by this point every file has already
+			// been marked for deletion, so aborting here would leave neither the old
+			// version nor the new one -- which is precisely how a live update once left a
+			// machine with no application at all.
+			warn!(
+				log,
+				"Could not empty {:?} ({}). Leaving it in place; the new version is merged into it and the leftovers are swept by the next update.",
+				dir,
+				removed.unwrap_err()
+			);
 		}
-
-		// The directory could not be emptied, which in practice means something else is
-		// holding a file inside it -- a scanner, an indexer -- and that file is sitting
-		// delete-pending. We cannot make the holder let go.
-		//
-		// What matters is the NAME, not the bytes: the update folder is about to move a
-		// directory of the same name into this spot. Renaming works where deleting does
-		// not, because it needs no handle on the files within, so take the name and leave
-		// the husk for the next update to sweep.
-		//
-		// This is the difference between an update that survives and an installation that
-		// is destroyed. By this point every file has already been marked for deletion, so
-		// failing here leaves NEITHER the old version nor the new one -- which is exactly
-		// what happened when a scanner held three executables during a live 0.4.10 ->
-		// 0.4.11 update, and the user was left with no application at all.
-		let aside = dir.with_file_name(format!(
-			"{}.deleting-{}",
-			dir.file_name().and_then(|n| n.to_str()).unwrap_or("dir"),
-			std::process::id()
-		));
-		warn!(
-			log,
-			"Could not empty {:?} ({}). Renaming it to {:?} so the name is free; the leftover is swept by the next update.",
-			dir,
-			removed.unwrap_err(),
-			aside
-		);
-		fs::rename(&dir, &aside)?;
 	}
 
 	Ok(())
@@ -319,8 +349,7 @@ fn move_update(
 			&msg,
 			|attempt| {
 				info!(log, "Rename: {:?} (attempt {})", entry_name, attempt);
-				fs::rename(entry.path(), &target)?;
-				Ok(())
+				move_into_place(log, &entry.path(), &target)
 			},
 			None,
 		)?;
