@@ -4,17 +4,19 @@
  *----------------------------------------------------------------------------------------*/
 
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{error, io, ptr};
 use crate::strings::to_u16s;
 use crate::util;
 use windows_sys::Win32::Foundation::HANDLE;
 
-const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
-const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
-const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+static ASIDE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-pub struct FileHandle(HANDLE);
+pub struct FileHandle {
+	handle: HANDLE,
+	path: PathBuf,
+}
 
 impl FileHandle {
 	pub fn new(path: &Path) -> Result<FileHandle, Box<dyn error::Error>> {
@@ -27,13 +29,13 @@ impl FileHandle {
 		unsafe {
 			let path_wide = to_u16s(path.as_os_str());
 			// The only thing this handle is ever used for is DELETE. Asking for it with
-			// dwShareMode = 0 asks for much more than that: it fails unless NO other
-			// process holds ANY handle on the file. An antivirus service keeping a
+			// dwShareMode = 0 asks for much more than that: the open then fails unless NO
+			// other process holds ANY handle on the file. An antivirus service keeping a
 			// read handle on the main executable is enough, and that is not a state the
 			// updater can wait out -- it is not our process and it does not have to let
-			// go. Sharing the file costs nothing here and removes a whole class of
-			// update failure that presents as "used by another process (os error 32)"
-			// after every one of the application's own processes has already exited.
+			// go. Sharing the file costs nothing here and removes a whole class of update
+			// failure that presents as "used by another process (os error 32)" after
+			// every one of the application's own processes has already exited.
 			let handle = CreateFileW(
 				path_wide.as_ptr(),
 				DELETE,
@@ -48,64 +50,91 @@ impl FileHandle {
 				return Err(io::Error::last_os_error().into());
 			}
 
-			Ok(FileHandle(handle))
+			Ok(FileHandle {
+				handle,
+				path: path.to_path_buf(),
+			})
 		}
 	}
 
-	pub fn mark_for_deletion(&self) -> Result<(), Box<dyn error::Error>> {
-		// Unlink the NAME now, rather than when the last handle closes.
-		//
-		// The legacy disposition only schedules the delete: the directory entry stays
-		// behind in a delete-pending state until every handle on the file is closed, and
-		// the caller does not own all of them -- a scanner can be holding one. Every open
-		// of a delete-pending name fails, so the entry blocks the very rename the updater
-		// performs next to move the new version into place.
-		//
-		// POSIX semantics remove the entry immediately and let the remaining handles keep
-		// reading the now-nameless file until they close on their own. That is exactly
-		// what this code path wants. It needs Windows 10 1709+ on NTFS, so an older system
-		// or another filesystem falls back to the legacy behaviour, which is no worse than
-		// what shipped before.
-		match self.set_disposition_posix() {
-			Ok(()) => Ok(()),
-			Err(_) => self.set_disposition_legacy(),
-		}
+	pub fn path(&self) -> &Path {
+		&self.path
 	}
 
-	fn set_disposition_posix(&self) -> Result<(), Box<dyn error::Error>> {
-		self.set_disposition_ex(
-			FILE_DISPOSITION_FLAG_DELETE
-				| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-				| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-		)
-	}
-
-	fn set_disposition_ex(&self, flags: u32) -> Result<(), Box<dyn error::Error>> {
+	/// Move the directory entry out of the way, so the NAME is free immediately.
+	///
+	/// Marking a file for deletion only schedules it: the entry survives until the LAST
+	/// handle on the file closes, and the updater does not own all of them -- a virus
+	/// scanner can be holding one, and does not have to let go on our schedule. Until it
+	/// does, the name stays behind in a delete-pending state where every open of it
+	/// fails, including the rename that moves the new version into that exact name.
+	///
+	/// Renaming through the handle we already hold sidesteps that. The name is free the
+	/// moment the call returns no matter who else has the file open, and the renamed
+	/// entry still carries the delete disposition, so it disappears by itself as soon as
+	/// the last holder lets go.
+	///
+	/// Measured, not assumed: `FileDispositionInfoEx` with `POSIX_SEMANTICS` was tried
+	/// first and does NOT free the name while another handle is open -- the call reports
+	/// success and the entry stays. A rename does free it.
+	pub fn rename_aside(&self) -> Result<(), Box<dyn error::Error>> {
 		use std::mem;
 		use windows_sys::Win32::Storage::FileSystem::{
-			FileDispositionInfoEx, SetFileInformationByHandle,
+			FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
 		};
 
-		// windows-sys 0.42 exposes the info class but not the struct.
-		#[repr(C)]
-		struct FileDispositionInfoExData {
-			flags: u32,
-		}
+		let file_name = self
+			.path
+			.file_name()
+			.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Could not get file name"))?
+			.to_string_lossy()
+			.into_owned();
+		let directory = self
+			.path
+			.parent()
+			.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Could not get parent path"))?;
+
+		// Distinct per process and per file, so two of these can never collide and a
+		// leftover is recognizable in a directory listing. Leftovers only happen when a
+		// holder never lets go, and the next update sweeps them: it deletes everything
+		// in the old installation anyway.
+		let unique = ASIDE_COUNTER.fetch_add(1, Ordering::Relaxed);
+		let target = directory.join(format!(
+			"{}.deleting-{}-{}",
+			file_name,
+			std::process::id(),
+			unique
+		));
+
+		// FILE_RENAME_INFO is variable length: the struct, then the name in place of its
+		// one-element FileName array. Building it through the struct rather than by hand
+		// keeps the field offsets right on both i686 and x64, where HANDLE differs in
+		// size and alignment.
+		let target_wide = to_u16s(target.as_os_str());
+		let name = &target_wide[..target_wide.len() - 1]; // the length excludes the terminator
+		let name_bytes = name.len() * mem::size_of::<u16>();
+		let mut buffer = vec![0u8; mem::size_of::<FILE_RENAME_INFO>() + name_bytes];
 
 		unsafe {
-			let mut info = FileDispositionInfoExData { flags };
+			let info = buffer.as_mut_ptr() as *mut FILE_RENAME_INFO;
+			(*info).Anonymous.ReplaceIfExists = 0;
+			(*info).RootDirectory = 0 as HANDLE;
+			(*info).FileNameLength = name_bytes as u32;
+			ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+
 			let result = SetFileInformationByHandle(
-				self.0,
-				FileDispositionInfoEx,
-				&mut info as *mut _ as *mut c_void,
-				mem::size_of::<FileDispositionInfoExData>() as u32,
+				self.handle,
+				FileRenameInfo,
+				buffer.as_ptr() as *const c_void,
+				buffer.len() as u32,
 			);
 
 			if result == 0 {
 				return Err(io::Error::new(
 					io::ErrorKind::Other,
 					format!(
-						"Failed to unlink file: {}",
+						"Failed to move {:?} aside: {}",
+						self.path,
 						util::get_last_error_message()?
 					),
 				)
@@ -116,7 +145,7 @@ impl FileHandle {
 		Ok(())
 	}
 
-	fn set_disposition_legacy(&self) -> Result<(), Box<dyn error::Error>> {
+	pub fn mark_for_deletion(&self) -> Result<(), Box<dyn error::Error>> {
 		use std::mem;
 		use windows_sys::Win32::Foundation::BOOLEAN;
 		use windows_sys::Win32::Storage::FileSystem::{
@@ -128,15 +157,15 @@ impl FileHandle {
 				DeleteFile: 1 as BOOLEAN,
 			};
 			let result = SetFileInformationByHandle(
-				self.0,
+				self.handle,
 				FileDispositionInfo,
 				&mut info as *mut _ as *mut c_void,
 				mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
 			);
 
-			// SetFileInformationByHandle returns BOOL, whose failure value is 0 and
-			// never negative, so the `is_negative()` check this replaces could not
-			// fire: a failed disposition was reported to the caller as success.
+			// SetFileInformationByHandle returns BOOL, whose failure value is 0 and never
+			// negative, so the `is_negative()` check this replaces could not fire: a
+			// failed disposition was reported to the caller as success.
 			if result == 0 {
 				return Err(io::Error::new(
 					io::ErrorKind::Other,
@@ -156,7 +185,7 @@ impl FileHandle {
 		use windows_sys::Win32::Foundation::CloseHandle;
 
 		unsafe {
-			if CloseHandle(self.0).is_negative() {
+			if CloseHandle(self.handle) == 0 {
 				return Err(io::Error::new(
 					io::ErrorKind::Other,
 					format!(
@@ -182,67 +211,34 @@ mod tests {
 	/// executable, minutes after all of the application's own processes had exited. The
 	/// holder was an antivirus service, and an exclusive open cannot wait that out.
 	///
-	/// No antivirus is needed to reproduce it: before the fix, ANY second handle on the
+	/// No antivirus is needed to reproduce it: before the fix ANY second handle on the
 	/// file was enough. `fs::File::open` shares read, write and delete, which is how a
 	/// well-behaved scanner holds a file.
 	#[test]
-	fn deletes_a_file_another_process_holds_open() {
+	fn replaces_a_file_another_process_holds_open() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("held.exe");
-		fs::write(&path, b"payload").unwrap();
+		fs::write(&path, b"old").unwrap();
 
 		let scanner = fs::File::open(&path).unwrap();
 
 		let handle = FileHandle::new(&path).expect("opening must not require exclusive access");
-
-		// A fresh file and a fresh handle per combination: once a disposition is set on a
-		// handle, a later call on the SAME handle may be a no-op, which would report a
-		// working flag as broken (and the reverse).
-		let mut report = String::new();
-		for (label, flags) in [
-			("DELETE", FILE_DISPOSITION_FLAG_DELETE),
-			(
-				"DELETE|POSIX",
-				FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-			),
-			(
-				"DELETE|POSIX|IGNORE_READONLY",
-				FILE_DISPOSITION_FLAG_DELETE
-					| FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-					| FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-			),
-		] {
-			let probe_path = dir.path().join(format!("probe_{flags}.exe"));
-			fs::write(&probe_path, b"payload").unwrap();
-			let probe_scanner = fs::File::open(&probe_path).unwrap();
-			let probe = FileHandle::new(&probe_path).unwrap();
-			match probe.set_disposition_ex(flags) {
-				Ok(()) => report.push_str(&format!(
-					"  {label}: ok, name gone while held = {}\n",
-					!probe_path.exists()
-				)),
-				Err(err) => report.push_str(&format!("  {label}: {err}\n")),
-			}
-			probe.close().unwrap();
-			drop(probe_scanner);
-		}
-
+		handle.rename_aside().expect("the entry must move aside");
 		handle
 			.mark_for_deletion()
 			.expect("marking for deletion must work while another handle is open");
-
-		// The name has to be gone NOW, not when the scanner lets go: the updater renames
-		// the new version onto this path as its very next step, and a delete-pending
-		// entry would fail that rename.
-		assert!(
-			!path.exists(),
-			"the name must be unlinked while another handle is still open\n{report}"
-		);
-
 		handle.close().unwrap();
+
+		// The name has to be free NOW, not when the scanner lets go: moving the new
+		// version into that exact name is the updater's very next step.
+		assert!(!path.exists(), "the name must be free while the file is held");
+		fs::write(&path, b"new").expect("the new version must take the freed name");
+		assert_eq!(fs::read(&path).unwrap(), b"new");
+
 		drop(scanner);
 	}
 
+	/// The ordinary case: nobody else has the file, so it goes away completely.
 	#[test]
 	fn deletes_a_file_nobody_holds_open() {
 		let dir = tempfile::tempdir().unwrap();
@@ -250,9 +246,15 @@ mod tests {
 		fs::write(&path, b"payload").unwrap();
 
 		let handle = FileHandle::new(&path).unwrap();
+		handle.rename_aside().unwrap();
 		handle.mark_for_deletion().unwrap();
 		handle.close().unwrap();
 
 		assert!(!path.exists(), "the file must be gone");
+		assert_eq!(
+			fs::read_dir(dir.path()).unwrap().count(),
+			0,
+			"and must leave nothing behind"
+		);
 	}
 }

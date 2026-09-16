@@ -149,7 +149,9 @@ fn delete_existing_version(
 
 				directories.push_back(entry_path);
 			} else if entry_file_type.is_file() {
-				// attempt to get exclusive file handle
+				// Shared, not exclusive: all this handle is used for is DELETE, and
+				// demanding exclusivity fails whenever anything else -- a virus scanner,
+				// say -- has the file open.
 				let msg = format!("Opening file handle: {:?}", entry_path);
 				let file_handle = util::retry(
 					&msg,
@@ -172,6 +174,15 @@ fn delete_existing_version(
 	info!(log, "Collected all directories and file handles");
 
 	for file_handle in &file_handles {
+		// Free the NAME first. The deletion below only lands when the LAST handle on the
+		// file closes, and we do not own all of them, so without this the entry can sit
+		// in the directory in a delete-pending state -- blocking the rename that moves
+		// the new version into that exact name. Best effort: a file nobody else is
+		// holding is deleted correctly either way.
+		if let Err(err) = file_handle.rename_aside() {
+			warn!(log, "{}", err);
+		}
+
 		util::retry(
 			"marking a file for deletion",
 			|_| -> Result<(), Box<dyn error::Error>> { file_handle.mark_for_deletion() },
