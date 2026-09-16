@@ -51,7 +51,7 @@ jobs:
       # disposition class -- neither leaves a string to grep for, so it is pinned by a
       # test that reproduces the failure instead: a second open handle on the file.
       - name: Test
-        run: cargo test --bin inno_updater -- handle::
+        run: 'cargo test --bin inno_updater -- handle::'
 
       - name: Verify the branding landed in the binary
         shell: bash
