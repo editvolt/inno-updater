@@ -331,9 +331,109 @@ pub fn capture_running_processes(
 	Ok(target_processes)
 }
 
+/// Pure: whether `path` lies inside the folder `root` (case-insensitive, as Windows paths are).
+fn path_is_under(path: &Path, root: &Path) -> bool {
+	let path = path.to_string_lossy().to_lowercase();
+	let mut root = root.to_string_lossy().to_lowercase();
+	if !root.ends_with('\\') {
+		root.push('\\');
+	}
+	path.starts_with(&root)
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+	// Declared here rather than taken from windows-sys: this helper is 32-bit, and unlike
+	// K32GetModuleFileNameExW this call reads the image path of a 64-bit process too.
+	fn QueryFullProcessImageNameW(process: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+}
+
+/// Every process whose executable lives under `root`, except this one.
+///
+/// The application's own executable is waited for by name (capture_running_processes), but the
+/// helpers it started -- a language server, a file search -- can outlive it, and on Windows a
+/// running executable cannot be deleted. Live (2026-10-31): `rg.exe` and a language server held
+/// two files under resources/, every other file was deleted, the folder could not be, and the
+/// update gave up with the installation half removed. After the application has exited, anything
+/// still running from its folder is a leftover, so it is captured here and ended.
+pub fn capture_processes_under(
+	log: &slog::Logger,
+	root: &Path,
+) -> Result<Vec<CapturedProcess>, Box<dyn error::Error>> {
+	use windows_sys::Win32::Foundation::CloseHandle;
+	use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
+
+	const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+	const SYNCHRONIZE_ACCESS: u32 = 0x00100000;
+
+	let own = std::process::id();
+	let mut captured = Vec::new();
+
+	for process in get_running_processes()? {
+		if process.id == own || process.id == 0 {
+			continue;
+		}
+
+		let handle = unsafe {
+			OpenProcess(
+				PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE_ACCESS,
+				0,
+				process.id,
+			)
+		};
+		if handle == 0 {
+			// Not openable by this user: not something the application started.
+			continue;
+		}
+
+		let mut raw = [0u16; 1024];
+		let mut len = raw.len() as u32;
+		let ok = unsafe { QueryFullProcessImageNameW(handle, 0, raw.as_mut_ptr(), &mut len) };
+		let image = if ok != 0 {
+			from_utf16(&raw[0..len as usize]).ok().map(PathBuf::from)
+		} else {
+			None
+		};
+
+		match image {
+			Some(image) if path_is_under(&image, root) => {
+				info!(
+					log,
+					"Found {} still running from the install folder as pid {}",
+					image.display(),
+					process.id
+				);
+				captured.push(CapturedProcess {
+					name: process.name.clone(),
+					id: process.id,
+					handle,
+				});
+			}
+			_ => unsafe {
+				CloseHandle(handle);
+			},
+		}
+	}
+
+	if captured.is_empty() {
+		info!(log, "Nothing else is running from {}", root.display());
+	}
+
+	Ok(captured)
+}
+
 pub fn wait_or_kill(
 	log: &slog::Logger,
 	target_processes: &[CapturedProcess],
+) -> Result<(), Box<dyn error::Error>> {
+	wait_or_kill_within(log, target_processes, 60)
+}
+
+/// As wait_or_kill, giving up waiting after `attempts` checks 500 ms apart.
+pub fn wait_or_kill_within(
+	log: &slog::Logger,
+	target_processes: &[CapturedProcess],
+	attempts: u32,
 ) -> Result<(), Box<dyn error::Error>> {
 	if target_processes.is_empty() {
 		return Ok(());
@@ -370,8 +470,8 @@ pub fn wait_or_kill(
 			break;
 		}
 
-		// give up after 60 * 500ms = 30 seconds
-		if attempt == 60 {
+		// give up after attempts * 500ms (60: 30 seconds)
+		if attempt >= attempts {
 			info!(
 				log,
 				"Gave up waiting for {} to exit, {} processes still running: {:?}",
@@ -506,6 +606,17 @@ mod tests {
 			captured.is_empty(),
 			"csrss is protected from every caller, so nothing should have been capturable"
 		);
+	}
+
+	#[test]
+	fn path_under_matches_inside_the_folder_only() {
+		let root = Path::new("C:\\Users\\A\\AppData\\Local\\Programs\\Aira");
+		assert!(path_is_under(Path::new("C:\\Users\\A\\AppData\\Local\\Programs\\Aira\\resources\\app\\rg.exe"), root));
+		assert!(path_is_under(Path::new("c:\\users\\a\\appdata\\local\\programs\\aira\\Aira.exe"), root));
+		// A sibling folder that shares the prefix is not inside it.
+		assert!(!path_is_under(Path::new("C:\\Users\\A\\AppData\\Local\\Programs\\Aira Insiders\\Aira.exe"), root));
+		assert!(!path_is_under(Path::new("C:\\Windows\\System32\\cmd.exe"), root));
+		assert!(path_is_under(Path::new("C:\\x\\y.exe"), Path::new("C:\\x\\")));
 	}
 
 	#[test]

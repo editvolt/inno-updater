@@ -1,6 +1,6 @@
 # inno-updater
 
-Windows background-update helper, used by [EditVolt](https://editvolt.com) during an
+Windows background-update helper, used by Aira during an
 in-place update. Inno Setup launches it to swap the installed executables once the running
 application has exited.
 
@@ -42,3 +42,11 @@ Cargo compiles unsigned build scripts and an Enforced policy refuses to execute 
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright (c) Microsoft Corporation.
+
+## Leftover processes (2026-10-31)
+
+After the application's own executable has exited, the helper also ends any process still running
+from the install folder (`process::capture_processes_under`): a language server or file search the
+application started can outlive it, and a running executable cannot be deleted, which left an
+installation half removed. The helper waits 2 s, then ends them; a failure there is logged and the
+update continues.

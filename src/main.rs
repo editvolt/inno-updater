@@ -613,6 +613,19 @@ fn update(
 		window.update_status("Attempting to stop current running application...");
 		process::wait_or_kill(log, &running_processes)?;
 
+		// Then anything else still running from the install folder (process::capture_processes_under):
+		// a helper that outlived the application keeps its files open and the update cannot finish.
+		window.update_status("Closing programs still running from the install folder...");
+		let install_root = code_path.parent().unwrap_or(code_path);
+		match process::capture_processes_under(log, install_root) {
+			Ok(leftovers) => {
+				if let Err(err) = process::wait_or_kill_within(log, &leftovers, 4) {
+					warn!(log, "Could not end every leftover process: {}", err);
+				}
+			}
+			Err(err) => warn!(log, "Could not list running processes: {}", err),
+		}
+
 		// If a commit argument was provided, attempt to remove files not associated with that commit
 		if let Some(ref commit_str) = commit {
 			window.update_status("Cleaning up old files...");
@@ -658,6 +671,19 @@ fn update(
 		window.update_status("Waiting for the application to close...");
 		let running_processes = process::capture_running_processes(log, code_path)?;
 		process::wait_or_kill(log, &running_processes)?;
+
+		// Then anything else still running from the install folder (process::capture_processes_under):
+		// a helper that outlived the application keeps its files open and the update cannot finish.
+		window.update_status("Closing programs still running from the install folder...");
+		let install_root = code_path.parent().unwrap_or(code_path);
+		match process::capture_processes_under(log, install_root) {
+			Ok(leftovers) => {
+				if let Err(err) = process::wait_or_kill_within(log, &leftovers, 4) {
+					warn!(log, "Could not end every leftover process: {}", err);
+				}
+			}
+			Err(err) => warn!(log, "Could not list running processes: {}", err),
+		}
 
 		// Fall back to the original update method if no new executable is found
 		do_update(log, code_path, update_folder_name)?;

@@ -14,11 +14,11 @@ on:
       product_name:
         description: 'Product name compiled into the binary'
         required: true
-        default: 'EditVolt'
+        default: 'Aira'
       company_name:
         description: 'Company name in the version resource'
         required: true
-        default: 'Editvolt.com'
+        default: 'Adobe'
       release_tag:
         description: 'Publish a release under this tag (blank = artifact only)'
         required: false
@@ -37,8 +37,8 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      INNO_UPDATER_PRODUCT_NAME: ${{ github.event.inputs.product_name || 'EditVolt' }}
-      INNO_UPDATER_COMPANY_NAME: ${{ github.event.inputs.company_name || 'Editvolt.com' }}
+      INNO_UPDATER_PRODUCT_NAME: ${{ github.event.inputs.product_name || 'Aira' }}
+      INNO_UPDATER_COMPANY_NAME: ${{ github.event.inputs.company_name || 'Adobe' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +51,7 @@ jobs:
       # rename -- neither leaves a string to grep for, so it is pinned by a test that
       # reproduces the failure instead: a second open handle on the file.
       - name: Test
-        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips'
+        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under'
 
       - name: Verify the branding landed in the binary
         shell: bash
@@ -70,6 +70,9 @@ jobs:
           # cheap proof the fix shipped rather than being optimized or edited away.
           grep -aq "Waiting for the application to close" "$EXE" || {
             echo "FAIL: the traditional-path process wait is missing from the binary"; exit 1; }
+          # The leftover-process sweep (helpers still running from the install folder).
+          grep -aq "Closing programs still running from the install folder" "$EXE" || {
+            echo "FAIL: the install-folder sweep is missing from the binary"; exit 1; }
           sha256sum "$EXE" | awk '{print $1}' > inno_updater.exe.sha256
           echo "sha256: $(cat inno_updater.exe.sha256)"
           cp "$EXE" ./inno_updater.exe
