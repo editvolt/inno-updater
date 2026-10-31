@@ -342,7 +342,7 @@ fn path_is_under(path: &Path, root: &Path) -> bool {
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
 	// Declared here rather than taken from windows-sys: this helper is 32-bit, and unlike
 	// K32GetModuleFileNameExW this call reads the image path of a 64-bit process too.
 	fn QueryFullProcessImageNameW(process: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
