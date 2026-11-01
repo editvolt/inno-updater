@@ -51,7 +51,7 @@ jobs:
       # rename -- neither leaves a string to grep for, so it is pinned by a test that
       # reproduces the failure instead: a second open handle on the file.
       - name: Test
-        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under'
+        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under tests::delete_existing_version'
 
       - name: Verify the branding landed in the binary
         shell: bash
@@ -73,6 +73,9 @@ jobs:
           # The leftover-process sweep (helpers still running from the install folder).
           grep -aq "Closing programs still running from the install folder" "$EXE" || {
             echo "FAIL: the install-folder sweep is missing from the binary"; exit 1; }
+          # Husks left by an earlier update (still held) must be skipped, not opened.
+          grep -aq "Skipping a file an earlier update already marked for deletion" "$EXE" || {
+            echo "FAIL: the husk skip is missing from the binary"; exit 1; }
           sha256sum "$EXE" | awk '{print $1}' > inno_updater.exe.sha256
           echo "sha256: $(cat inno_updater.exe.sha256)"
           cp "$EXE" ./inno_updater.exe

@@ -13,6 +13,25 @@ use windows_sys::Win32::Foundation::HANDLE;
 
 static ASIDE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// True for a name `rename_aside` gives a file: `<name>.deleting-<pid>-<n>`.
+///
+/// Such a file is already marked for deletion and only waits for some other holder -- a
+/// virus scanner, an indexer -- to let go. Until then Windows refuses every open of it
+/// (ACCESS_DENIED), so a later update must not try to open it: one leftover from the
+/// previous update failed every update after it (2026-11-01, "There was an error while
+/// Opening file handle: ...Aira.exe.deleting-18348-0: Access is denied").
+pub fn is_aside_name(name: &str) -> bool {
+	let Some(at) = name.rfind(".deleting-") else {
+		return false;
+	};
+	if at == 0 {
+		return false;
+	}
+	let mut parts = name[at + ".deleting-".len()..].split('-');
+	let all_digits = |s: Option<&str>| s.map_or(false, |s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+	all_digits(parts.next()) && all_digits(parts.next()) && parts.next().is_none()
+}
+
 pub struct FileHandle {
 	handle: HANDLE,
 	path: PathBuf,
@@ -205,6 +224,42 @@ impl FileHandle {
 mod tests {
 	use super::*;
 	use std::fs;
+
+	#[test]
+	fn aside_names_are_recognized() {
+		assert!(is_aside_name("Aira.exe.deleting-18348-0"));
+		assert!(is_aside_name("ffmpeg.dll.deleting-1-12"));
+		assert!(!is_aside_name("Aira.exe"));
+		assert!(!is_aside_name("notes.deleting-later.txt"));
+		assert!(!is_aside_name("a.deleting-12"));
+		assert!(!is_aside_name("a.deleting-12-x"));
+		assert!(!is_aside_name("a.deleting-1-2-3"));
+		assert!(!is_aside_name(".deleting-1-2"));
+	}
+
+	/// Regression (2026-11-01): a file moved aside while held stays delete-pending until
+	/// its holder lets go, and in that state it cannot be opened at all. The next update
+	/// opened every file in the old installation and failed on it after 16 attempts.
+	#[test]
+	fn a_moved_aside_file_cannot_be_reopened_while_held() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("held.exe");
+		fs::write(&path, b"old").unwrap();
+		let scanner = fs::File::open(&path).unwrap();
+
+		let handle = FileHandle::new(&path).unwrap();
+		handle.rename_aside().unwrap();
+		handle.mark_for_deletion().unwrap();
+		handle.close().unwrap();
+
+		let aside: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+		assert_eq!(aside.len(), 1, "the husk is still listed while held");
+		let name = aside[0].file_name().unwrap().to_string_lossy().into_owned();
+		assert!(is_aside_name(&name), "{} is recognized as a husk", name);
+		assert!(FileHandle::new(&aside[0]).is_err(), "a delete-pending file refuses every open");
+
+		drop(scanner);
+	}
 
 	/// Regression: every background update failed with "The process cannot access the
 	/// file because it is being used by another process. (os error 32)" on the main

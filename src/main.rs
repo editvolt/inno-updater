@@ -188,6 +188,13 @@ fn delete_existing_version(
 				}
 
 				directories.push_back(entry_path);
+			} else if entry_file_type.is_file() && handle::is_aside_name(entry_name) {
+				// A husk an earlier update moved aside while something held it. It is
+				// already marked for deletion and refuses every open until its holder lets
+				// go, so opening it here failed the whole update, every time, for as long
+				// as the holder lived (2026-11-01). Its name is unique, so the new version
+				// never needs it; it disappears by itself when the holder lets go.
+				warn!(log, "Skipping a file an earlier update already marked for deletion: {:?}", entry_path);
 			} else if entry_file_type.is_file() {
 				// Shared, not exclusive: all this handle is used for is DELETE, and
 				// demanding exclusivity fails whenever anything else -- a virus scanner,
@@ -1552,6 +1559,52 @@ mod tests {
         );
 
         lock.close().unwrap();
+    }
+
+    // Leaves a husk: `name` moved aside and marked for deletion while `holder` keeps it open,
+    // exactly what an update leaves behind when a scanner holds a file.
+    fn leave_held_husk(path: &std::path::Path) -> fs::File {
+        fs::write(path, b"old").unwrap();
+        let holder = fs::File::open(path).unwrap();
+        let handle = crate::handle::FileHandle::new(path).unwrap();
+        handle.rename_aside().unwrap();
+        handle.mark_for_deletion().unwrap();
+        handle.close().unwrap();
+        holder
+    }
+
+    /// Regression (2026-11-01): the previous update left `Aira.exe.deleting-18348-0` behind,
+    /// still held by a scanner. Every later update failed on "Opening file handle: ...
+    /// Access is denied" after 16 attempts. The husk is skipped; everything else goes.
+    #[test]
+    fn delete_existing_version_skips_husks_left_by_an_earlier_update() {
+        let temp_dir = tempdir().unwrap();
+        let log = setup_test_logger();
+        let root = temp_dir.path();
+
+        let holder_root = leave_held_husk(&root.join("Aira.exe"));
+        fs::write(root.join("Aira.exe"), b"current").unwrap();
+        let app = root.join("resources").join("app");
+        fs::create_dir_all(&app).unwrap();
+        let holder_sub = leave_held_husk(&app.join("main.js"));
+        fs::write(app.join("main.js"), b"current").unwrap();
+        fs::create_dir(root.join("tools")).unwrap();
+        fs::write(root.join("tools").join("inno_updater.exe"), b"me").unwrap();
+        fs::write(root.join("unins000.dat"), b"keep").unwrap();
+        fs::create_dir(root.join("_")).unwrap();
+        fs::write(root.join("_").join("Aira.exe"), b"new").unwrap();
+
+        let result = delete_existing_version(&log, root, "_");
+        assert!(result.is_ok(), "a held husk must not fail the update: {:?}", result.err());
+
+        assert!(!root.join("Aira.exe").exists(), "the old version is deleted");
+        assert!(!app.join("main.js").exists(), "files in subfolders are deleted");
+        assert!(root.join("tools").join("inno_updater.exe").exists(), "the updater is kept");
+        assert!(root.join("unins000.dat").exists(), "the uninstaller data is kept");
+        assert!(root.join("_").join("Aira.exe").exists(), "the new version is untouched");
+
+        drop(holder_root);
+        drop(holder_sub);
     }
 }
 
