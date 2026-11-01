@@ -55,6 +55,24 @@ where
 	}
 }
 
+/// The same backoff as `retry`, without the Retry / Cancel dialog: for steps whose failure the
+/// caller handles itself. A dialog there only told the user "There was an error" about a
+/// step that could not fail the update, and blocked until they answered.
+pub fn retry_quiet<F, R>(closure: F, max_attempts: u32) -> Result<R, Box<dyn error::Error>>
+where
+	F: Fn(u32) -> Result<R, Box<dyn error::Error>>,
+{
+	let mut attempt: u32 = 0;
+	loop {
+		attempt += 1;
+		match closure(attempt) {
+			Ok(r) => return Ok(r),
+			Err(err) if attempt >= max_attempts => return Err(err),
+			Err(_) => thread::sleep(time::Duration::from_millis((attempt.pow(2) * 50) as u64)),
+		}
+	}
+}
+
 pub fn get_last_error_message() -> Result<String, Box<dyn error::Error>> {
 	use windows_sys::Win32::Foundation::GetLastError;
 	use windows_sys::Win32::System::Diagnostics::Debug::{

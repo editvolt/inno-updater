@@ -51,6 +51,8 @@ jobs:
       # rename -- neither leaves a string to grep for, so it is pinned by a test that
       # reproduces the failure instead: a second open handle on the file.
       - name: Test
+        # A Retry / Cancel dialog reached in a test waits for a click that never comes.
+        timeout-minutes: 10
         run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under tests::delete_existing_version'
 
       - name: Verify the branding landed in the binary

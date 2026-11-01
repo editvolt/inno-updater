@@ -263,9 +263,10 @@ fn delete_existing_version(
 	info!(log, "All files deleted");
 
 	for dir in top_directories {
-		let msg = format!("Deleting a directory: {:?}", dir);
-		let removed = util::retry(
-			&msg,
+		// Quiet: a directory that cannot be emptied is handled below (the new version is
+		// merged into it), so a Retry / Cancel dialog here only alarmed the user -- and a
+		// husk left by an earlier update, still held, made it appear on every update.
+		let removed = util::retry_quiet(
 			|attempt| -> Result<(), Box<dyn error::Error>> {
 				if !dir.exists() {
 					return Ok(());
@@ -279,7 +280,7 @@ fn delete_existing_version(
 				fs::remove_dir_all(&dir)?;
 				Ok(())
 			},
-			Some(8),
+			8,
 		);
 
 		if removed.is_err() {
