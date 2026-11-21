@@ -559,10 +559,11 @@ mod tests {
 			.parent()
 			.unwrap()
 			.join("test_helper.exe");
-		if !helper.exists() {
-			eprintln!("skipping: no test_helper at {:?}", helper);
-			return;
-		}
+		assert!(
+			helper.exists(),
+			"build.rs builds the test helper at {:?}",
+			helper
+		);
 		let copy = root.join("bin").join("helper.exe");
 		fs::create_dir_all(copy.parent().unwrap()).unwrap();
 		fs::copy(&helper, &copy).unwrap();

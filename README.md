@@ -88,6 +88,9 @@ only while the installed version is still complete.
 
 ### Decision table
 
+The update moves `_` in directory order, which puts the executable first (`repair` always moves it
+first), so "executable still staged, stage incomplete" is never a move in progress.
+
 `overlap` = files present at the same relative path in `_` and in the root. Moving a file into
 place removes it from `_`, so an overlapping root file was not put there by this update: it is an
 old-version file deletion had not reached.
@@ -103,8 +106,7 @@ old-version file deletion had not reached.
 | yes | yes | no | root `resources\app\product.json` | **11** staging stopped, updater never ran: `_` discarded |
 | yes | yes | any | no root `resources\app\product.json` | **20** inconsistent |
 | no | yes | yes | -- | **10** deletion was interrupted: delete the overlapping old files, move `_` in |
-| no | yes | no | no overlap, root `resources\app\product.json` | **10** move was interrupted before the exe: move the rest |
-| no | yes | no | otherwise | **20** old exe gone and stage incomplete: reinstall |
+| no | yes | no | -- | **20** old exe gone and stage incomplete: reinstall |
 | yes | no | any | no overlap, `product.json` in root or `_` | **10** move was interrupted after the exe: move the rest |
 | yes | no | no | overlap, root `resources\app\product.json` | **11** staging stopped before the exe: `_` discarded |
 | yes | no | yes | overlap | **20** inconsistent |

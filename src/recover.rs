@@ -261,11 +261,11 @@ pub fn decide(e: &Evidence) -> Decision {
 				complete(
 					"the update was interrupted while replacing the old version; the staged version is complete, so the update is finished",
 				)
-			} else if e.overlap.is_empty() && e.root_marker {
-				complete(
-					"the update was interrupted while moving the new version into place (resources already moved, executable not yet); the move is finished",
-				)
 			} else {
+				// The update moves the stage in directory order, the executable first for
+				// any product whose name sorts before its folders (and `repair` always moves
+				// it first), so an incomplete stage that still holds the executable is not
+				// a move that stopped: it is an unfinished stage beside a missing exe.
 				refuse(
 					"the installed executable is gone and the staged version is incomplete; neither version can be restored, reinstall",
 				)
@@ -617,14 +617,14 @@ mod tests {
 	}
 
 	#[test]
-	fn interrupted_move_before_the_exe_is_completed() {
+	fn incomplete_stage_beside_a_missing_exe_is_refused_even_without_overlap() {
 		let e = Evidence {
 			root_exe: false,
 			stage: staged(true, false),
 			root_marker: true,
 			..ev()
 		};
-		assert_eq!(outcome(&e), Outcome::Completed);
+		assert_eq!(outcome(&e), Outcome::Refused);
 	}
 
 	#[test]
