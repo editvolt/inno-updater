@@ -75,6 +75,12 @@ pub fn run(
 		return (Outcome::Busy, reason);
 	}
 
+	if let Some(why) = held(root, &decision.action) {
+		let reason = format!("not repairing while {}", why);
+		warn!(log, "recover: {}", reason);
+		return (Outcome::Busy, reason);
+	}
+
 	match apply(log, root, exe, &decision.action) {
 		Ok(()) => {
 			info!(log, "recover: done, {}", decision.outcome.label());
@@ -119,6 +125,33 @@ fn busy(log: &slog::Logger, root: &Path, mutex: &str, from_setup: bool) -> Optio
 		)),
 		Err(err) => Some(format!("running programs could not be listed ({})", err)),
 	}
+}
+
+/// Open every old file the repair must delete, the way the delete will, before anything is
+/// changed. A file another program holds delete-pending can still look like a plain file to a
+/// metadata read, and the delete then fails half way; found here it is a clean `Busy`.
+fn held(root: &Path, action: &Action) -> Option<String> {
+	let Action::CompleteStaged { replace } = action else {
+		return None;
+	};
+	for rel in replace {
+		let path = root.join(rel);
+		match FileHandle::new(&path) {
+			Ok(handle) => {
+				let _ = handle.close();
+			}
+			Err(err) => {
+				let locked = err
+					.downcast_ref::<io::Error>()
+					.map(crate::is_skippable_lock_error)
+					.unwrap_or(false);
+				if locked {
+					return Some(format!("{:?} is held by another program ({})", path, err));
+				}
+			}
+		}
+	}
+	None
 }
 
 fn mutex_exists(name: &str) -> bool {
@@ -298,8 +331,15 @@ mod tests {
 	}
 
 	// A mutex name nothing else creates, so `busy` only sees this test's processes.
+	// Unique per call: tests run in parallel and some of them hold the mutex they name.
 	fn mutex() -> String {
-		format!("inno-updater-recover-test-{}", std::process::id())
+		use std::sync::atomic::{AtomicU32, Ordering};
+		static NEXT: AtomicU32 = AtomicU32::new(0);
+		format!(
+			"inno-updater-recover-test-{}-{}",
+			std::process::id(),
+			NEXT.fetch_add(1, Ordering::Relaxed)
+		)
 	}
 
 	fn write(path: &Path, body: &str) {
