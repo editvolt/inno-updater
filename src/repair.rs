@@ -537,8 +537,16 @@ mod tests {
 		assert_eq!(read(&root.join(EXE)), "old");
 	}
 
-	/// A program running from the install folder (here: a copy of the test helper) blocks
-	/// any repair; the decision is still logged and nothing changes.
+	/// Not a test: the process `a_running_program_blocks_the_repair` runs from the install
+	/// folder. Ignored, so it only runs when asked for by name.
+	#[test]
+	#[ignore]
+	fn busy_test_sleeper() {
+		std::thread::sleep(std::time::Duration::from_secs(60));
+	}
+
+	/// A program running from the install folder (a copy of this test binary, running
+	/// `busy_test_sleeper`) blocks any repair; the decision is still logged, nothing changes.
 	#[test]
 	fn a_running_program_blocks_the_repair() {
 		// Under the project, not %TEMP%: CI's temp folder is an 8.3 short path
@@ -552,30 +560,19 @@ mod tests {
 		let root = dir.path();
 		write(&root.join("old_Aira.exe"), "old");
 
-		let helper = std::env::current_exe()
-			.unwrap()
-			.parent()
-			.unwrap()
-			.parent()
-			.unwrap()
-			.join("test_helper.exe");
-		assert!(
-			helper.exists(),
-			"build.rs builds the test helper at {:?}",
-			helper
-		);
-		let copy = root.join("bin").join("helper.exe");
+		let copy = root.join("bin").join("sleeper.exe");
 		fs::create_dir_all(copy.parent().unwrap()).unwrap();
-		fs::copy(&helper, &copy).unwrap();
+		fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
 		let mut child = std::process::Command::new(&copy)
-			.arg("run-forever")
+			.args(["repair::tests::busy_test_sleeper", "--exact", "--ignored"])
+			.stdout(std::process::Stdio::null())
 			.spawn()
 			.unwrap();
 
-		let (outcome, _) = run(&logger(), root, EXE, &mutex());
+		let (outcome, reason) = run(&logger(), root, EXE, &mutex());
 		let _ = child.kill();
 		let _ = child.wait();
-		assert_eq!(outcome, Outcome::Busy);
+		assert_eq!(outcome, Outcome::Busy, "{}", reason);
 		assert!(!root.join(EXE).exists(), "nothing is changed while busy");
 	}
 
