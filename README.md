@@ -54,7 +54,7 @@ update continues.
 ## Recovering an interrupted update: `--recover` (2026-11-21)
 
 ```
-inno_updater.exe --recover <install root> [<exe name> [<mutex name>]]
+inno_updater.exe --recover <install root> [<exe name> [<mutex name>]] [--from-setup]
 ```
 
 Reads the install root for a background update that stopped half way (power loss, a killed
@@ -116,6 +116,10 @@ old-version file deletion had not reached.
 Always refused (20): `_` is not a folder; `_` holds `tools`, `unins*`, `appx` or `bootstrap`; `_`
 and `new_<exe>` both exist; a path is a file on one side and a folder (or link) on the other.
 
+Neither the update nor `--recover` writes a journal or keeps a backup: every decision is made
+from the files in the install root as they are, and the only record is the log file and the
+stdout lines below.
+
 A repair (10 or 11) is applied only when nothing is running: not while Setup's
 `<mutex>setup` / `<mutex>-updating` mutex exists (session or `Global\`), not while any program
 runs from the install root, and not while a needed name is held delete-pending by another
@@ -127,6 +131,20 @@ then every other entry of `_` (merging into surviving folders), removes `_`, and
 `_` are left: recover cannot tell an old-only file from a new file already moved, and never deletes
 what it cannot attribute. Discarding (11) renames `_` aside in one step, then deletes it. Every
 step is safe to repeat: a run that stops part way leaves a state that maps to the same action.
+
+### `--from-setup`: when Setup is the caller
+
+The running application cannot repair its own folder (a program running from the install root
+always means 21), and after a broken swap the application may not start at all. So the caller is
+Setup: `code.iss` runs `--recover <root> --from-setup` at the start of every install and update,
+before it stages anything. At that point Setup already holds its own `<mutex>setup` and
+`<mutex>-updating`, which without the flag would make every run report 21.
+
+`--from-setup` skips **only** that mutex check. A program running from the install root, or a
+file another program holds at a name the repair needs, still returns 21 and nothing changes.
+Nothing else differs: the same decision table, exit codes, log file and stdout lines. Do not pass
+it from anywhere but Setup; without it, a Setup mutex means another Setup is running and the
+result is 21.
 
 ### Exit codes
 

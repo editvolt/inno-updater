@@ -91,6 +91,8 @@ jobs:
           set +e; "$EXE" --recover "$HEALTHY"; CODE=$?; set -e
           test "$CODE" = 0 || { echo "FAIL: --recover on a healthy install exited $CODE, not 0"; exit 1; }
           test -f "$(cygpath -u "$HEALTHY")/$INNO_UPDATER_PRODUCT_NAME.exe" || { echo "FAIL: --recover touched a healthy install"; exit 1; }
+          set +e; "$EXE" --recover "$HEALTHY" --from-setup; CODE=$?; set -e
+          test "$CODE" = 0 || { echo "FAIL: --recover --from-setup on a healthy install exited $CODE, not 0"; exit 1; }
           BROKEN="$(cygpath -w "$RUNNER_TEMP")\\recover-broken"
           mkdir -p "$(cygpath -u "$BROKEN")"
           set +e; "$EXE" --recover "$BROKEN"; CODE=$?; set -e

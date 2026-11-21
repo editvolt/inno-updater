@@ -13,14 +13,26 @@ const ATTEMPTS: u32 = 8;
 
 /// Inspect `root`, decide, and repair when the decision says to. Returns the outcome and the
 /// one-line reason that was logged.
-pub fn run(log: &slog::Logger, root: &Path, exe: &str, mutex: &str) -> (Outcome, String) {
+///
+/// `from_setup`: the caller is Setup itself (`--from-setup`), which holds `<mutex>setup` and
+/// `<mutex>-updating` for its own run, so those two mutexes are not checked. Everything else
+/// that makes a repair unsafe -- a program running from the install folder, a held file --
+/// still returns `Busy`.
+pub fn run(
+	log: &slog::Logger,
+	root: &Path,
+	exe: &str,
+	mutex: &str,
+	from_setup: bool,
+) -> (Outcome, String) {
 	info!(
 		log,
-		"Inno Updater v{} recover: root={:?}, exe={}, mutex={}",
+		"Inno Updater v{} recover: root={:?}, exe={}, mutex={}, from_setup={}",
 		crate::VERSION,
 		root,
 		exe,
-		mutex
+		mutex,
+		from_setup
 	);
 
 	let evidence = match recover::inspect(root, exe) {
@@ -57,7 +69,7 @@ pub fn run(log: &slog::Logger, root: &Path, exe: &str, mutex: &str) -> (Outcome,
 		return (decision.outcome, decision.reason);
 	}
 
-	if let Some(why) = busy(log, root, mutex) {
+	if let Some(why) = busy(log, root, mutex, from_setup) {
 		let reason = format!("not repairing while {}", why);
 		warn!(log, "recover: {}", reason);
 		return (Outcome::Busy, reason);
@@ -80,13 +92,21 @@ pub fn run(log: &slog::Logger, root: &Path, exe: &str, mutex: &str) -> (Outcome,
 }
 
 /// Why the install folder must not be changed right now, if it must not.
-fn busy(log: &slog::Logger, root: &Path, mutex: &str) -> Option<String> {
+fn busy(log: &slog::Logger, root: &Path, mutex: &str, from_setup: bool) -> Option<String> {
 	// Setup holds `<mutex>setup` for its whole run and `<mutex>-updating` during a background
-	// update (GetSetupMutex in code.iss), in the session namespace or the global one.
-	for base in [format!("{}setup", mutex), format!("{}-updating", mutex)] {
-		for name in [base.clone(), format!("Global\\{}", base)] {
-			if mutex_exists(&name) {
-				return Some(format!("Setup is running (mutex {} exists)", name));
+	// update (GetSetupMutex in code.iss), in the session namespace or the global one. When
+	// Setup is the caller those are its own, so they say nothing about anyone else.
+	if from_setup {
+		info!(
+			log,
+			"recover: called by Setup; its own mutexes are not checked"
+		);
+	} else {
+		for base in [format!("{}setup", mutex), format!("{}-updating", mutex)] {
+			for name in [base.clone(), format!("Global\\{}", base)] {
+				if mutex_exists(&name) {
+					return Some(format!("Setup is running (mutex {} exists)", name));
+				}
 			}
 		}
 	}
@@ -349,9 +369,9 @@ mod tests {
 
 	fn recover_twice(root: &Path, first: Outcome) {
 		let log = logger();
-		let (outcome, reason) = run(&log, root, EXE, &mutex());
+		let (outcome, reason) = run(&log, root, EXE, &mutex(), false);
 		assert_eq!(outcome, first, "{}", reason);
-		let (again, reason) = run(&log, root, EXE, &mutex());
+		let (again, reason) = run(&log, root, EXE, &mutex(), false);
 		assert_eq!(
 			again,
 			Outcome::NothingToDo,
@@ -366,7 +386,7 @@ mod tests {
 		let root = dir.path();
 		version(root, "old");
 		keepers(root);
-		let (outcome, _) = run(&logger(), root, EXE, &mutex());
+		let (outcome, _) = run(&logger(), root, EXE, &mutex(), false);
 		assert_eq!(outcome, Outcome::NothingToDo);
 		assert_eq!(read(&root.join(EXE)), "old");
 	}
@@ -488,7 +508,7 @@ mod tests {
 		keepers(root);
 		version(&root.join(STAGE_DIR), "new");
 
-		let (outcome, _) = run(&logger(), root, EXE, &mutex());
+		let (outcome, _) = run(&logger(), root, EXE, &mutex(), false);
 		assert_eq!(outcome, Outcome::NothingToDo);
 		assert_eq!(read(&root.join(EXE)), "old");
 		assert_eq!(read(&root.join(STAGE_DIR).join(EXE)), "new");
@@ -503,7 +523,7 @@ mod tests {
 		write(&root.join(STAGE_DIR).join(EXE), "new");
 		fs::remove_file(root.join(EXE)).unwrap();
 
-		let (outcome, _) = run(&logger(), root, EXE, &mutex());
+		let (outcome, _) = run(&logger(), root, EXE, &mutex(), false);
 		assert_eq!(outcome, Outcome::Refused);
 		assert_eq!(
 			read(&root.join(STAGE_DIR).join(EXE)),
@@ -569,7 +589,7 @@ mod tests {
 			.spawn()
 			.unwrap();
 
-		let (outcome, reason) = run(&logger(), root, EXE, &mutex());
+		let (outcome, reason) = run(&logger(), root, EXE, &mutex(), false);
 		let _ = child.kill();
 		let _ = child.wait();
 		assert_eq!(outcome, Outcome::Busy, "{}", reason);
@@ -590,10 +610,98 @@ mod tests {
 		let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
 		assert!(handle != 0);
 
-		let (outcome, _) = run(&logger(), root, EXE, &name);
+		let (outcome, _) = run(&logger(), root, EXE, &name, false);
 		unsafe { CloseHandle(handle) };
 		assert_eq!(outcome, Outcome::Busy);
 		assert!(!root.join(EXE).exists());
+	}
+
+	fn hold_setup_mutex(name: &str) -> isize {
+		use windows_sys::Win32::System::Threading::CreateMutexW;
+		let wide = strings::to_u16s(OsStr::new(&format!("{}-updating", name)));
+		let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+		assert!(handle != 0);
+		handle
+	}
+
+	fn release(handle: isize) {
+		unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+	}
+
+	/// Setup runs --recover while it holds its own mutex: the mutex alone must not stop it.
+	#[test]
+	fn from_setup_ignores_the_setup_mutex() {
+		let dir = tempdir().unwrap();
+		let root = dir.path();
+		write(&root.join("old_Aira.exe"), "old");
+
+		let name = mutex();
+		let handle = hold_setup_mutex(&name);
+		let (outcome, reason) = run(&logger(), root, EXE, &name, true);
+		release(handle);
+		assert_eq!(outcome, Outcome::RolledBack, "{}", reason);
+		assert_eq!(read(&root.join(EXE)), "old");
+	}
+
+	/// --from-setup skips only the mutex: a program running from the folder still blocks.
+	#[test]
+	fn from_setup_still_reports_a_running_program() {
+		let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+		fs::create_dir_all(&base).unwrap();
+		let dir = tempfile::Builder::new()
+			.prefix("recover-busy-setup")
+			.tempdir_in(&base)
+			.unwrap();
+		let root = dir.path();
+		write(&root.join("old_Aira.exe"), "old");
+
+		let copy = root.join("bin").join("sleeper.exe");
+		fs::create_dir_all(copy.parent().unwrap()).unwrap();
+		fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+		let mut child = std::process::Command::new(&copy)
+			.args(["repair::tests::busy_test_sleeper", "--exact", "--ignored"])
+			.stdout(std::process::Stdio::null())
+			.spawn()
+			.unwrap();
+
+		let name = mutex();
+		let handle = hold_setup_mutex(&name);
+		let (outcome, reason) = run(&logger(), root, EXE, &name, true);
+		release(handle);
+		let _ = child.kill();
+		let _ = child.wait();
+		assert_eq!(outcome, Outcome::Busy, "{}", reason);
+		assert!(!root.join(EXE).exists(), "nothing is changed while busy");
+	}
+
+	/// --from-setup skips only the mutex: a file held delete-pending at a name the new
+	/// version needs still blocks.
+	#[test]
+	fn from_setup_still_reports_a_held_file() {
+		let dir = tempdir().unwrap();
+		let root = dir.path();
+		version(root, "old");
+		version(&root.join(STAGE_DIR), "new");
+		fs::remove_file(root.join(EXE)).unwrap();
+
+		// Delete-pending under its own name while another handle keeps it open.
+		let held = root.join("icudtl.dat");
+		let holder = fs::File::open(&held).unwrap();
+		let handle = FileHandle::new(&held).unwrap();
+		handle.mark_for_deletion().unwrap();
+		handle.close().unwrap();
+
+		let name = mutex();
+		let setup = hold_setup_mutex(&name);
+		let (outcome, reason) = run(&logger(), root, EXE, &name, true);
+		release(setup);
+		drop(holder);
+		assert_eq!(outcome, Outcome::Busy, "{}", reason);
+		assert_eq!(
+			read(&root.join(STAGE_DIR).join(EXE)),
+			"new",
+			"nothing is changed"
+		);
 	}
 
 	#[test]

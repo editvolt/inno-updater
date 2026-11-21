@@ -1611,12 +1611,16 @@ mod tests {
     }
 }
 
-/// `--recover <install root> [<exe name> [<mutex name>]]`. Returns the exit code.
+/// `--recover <install root> [<exe name> [<mutex name>]] [--from-setup]`. Returns the exit code.
 fn recover_main(args: &[String], log_path: &Path) -> i32 {
 	use recover::Outcome;
 
+	// Setup passes --from-setup: it holds its own mutexes while it runs --recover.
+	let from_setup = args.iter().any(|a| a == "--from-setup");
+	let args: Vec<String> = args.iter().filter(|a| *a != "--from-setup").cloned().collect();
+
 	if args.is_empty() || args.len() > 3 {
-		eprintln!("Usage: inno_updater --recover <install root> [<exe name> [<mutex name>]]");
+		eprintln!("Usage: inno_updater --recover <install root> [<exe name> [<mutex name>]] [--from-setup]");
 		return Outcome::Error.code();
 	}
 
@@ -1664,7 +1668,7 @@ fn recover_main(args: &[String], log_path: &Path) -> i32 {
 			error!(log, "recover: {}", reason);
 			(Outcome::Error, reason)
 		}
-		None => repair::run(&log, &root, &exe, &mutex),
+		None => repair::run(&log, &root, &exe, &mutex, from_setup),
 	};
 
 	println!("recover: {} ({}): {}", outcome.label(), outcome.code(), reason);
