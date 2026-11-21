@@ -25,6 +25,9 @@ on:
         default: ''
   push:
     branches: [main]
+  # Build and test every pull request too; the release step below only runs on a manual
+  # dispatch with a tag, so a pull request never publishes anything.
+  pull_request:
 
 permissions:
   contents: write
@@ -53,7 +56,7 @@ jobs:
       - name: Test
         # A Retry / Cancel dialog reached in a test waits for a click that never comes.
         timeout-minutes: 10
-        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under tests::delete_existing_version'
+        run: 'cargo test --bin inno_updater -- handle:: process::tests::capture_skips process::tests::path_under tests::delete_existing_version recover::tests repair::tests'
 
       - name: Verify the branding landed in the binary
         shell: bash
@@ -78,6 +81,20 @@ jobs:
           # Husks left by an earlier update (still held) must be skipped, not opened.
           grep -aq "Skipping a file an earlier update already marked for deletion" "$EXE" || {
             echo "FAIL: the husk skip is missing from the binary"; exit 1; }
+          # --recover and its probe, against the release binary itself.
+          test "$("$EXE" --capabilities | tr -d '\r')" = "recover" || {
+            echo "FAIL: --capabilities does not print 'recover'"; exit 1; }
+          HEALTHY="$(cygpath -w "$RUNNER_TEMP")\\recover-healthy"
+          mkdir -p "$(cygpath -u "$HEALTHY")/resources/app"
+          echo x > "$(cygpath -u "$HEALTHY")/$INNO_UPDATER_PRODUCT_NAME.exe"
+          echo x > "$(cygpath -u "$HEALTHY")/resources/app/product.json"
+          set +e; "$EXE" --recover "$HEALTHY"; CODE=$?; set -e
+          test "$CODE" = 0 || { echo "FAIL: --recover on a healthy install exited $CODE, not 0"; exit 1; }
+          test -f "$(cygpath -u "$HEALTHY")/$INNO_UPDATER_PRODUCT_NAME.exe" || { echo "FAIL: --recover touched a healthy install"; exit 1; }
+          BROKEN="$(cygpath -w "$RUNNER_TEMP")\\recover-broken"
+          mkdir -p "$(cygpath -u "$BROKEN")"
+          set +e; "$EXE" --recover "$BROKEN"; CODE=$?; set -e
+          test "$CODE" = 20 || { echo "FAIL: --recover with no executable anywhere exited $CODE, not 20"; exit 1; }
           sha256sum "$EXE" | awk '{print $1}' > inno_updater.exe.sha256
           echo "sha256: $(cat inno_updater.exe.sha256)"
           cp "$EXE" ./inno_updater.exe

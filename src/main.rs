@@ -20,6 +20,8 @@ mod gui;
 mod handle;
 mod model;
 mod process;
+mod recover;
+mod repair;
 mod resources;
 mod strings;
 mod util;
@@ -1609,6 +1611,70 @@ mod tests {
     }
 }
 
+/// `--recover <install root> [<exe name> [<mutex name>]]`. Returns the exit code.
+fn recover_main(args: &[String], log_path: &Path) -> i32 {
+	use recover::Outcome;
+
+	if args.is_empty() || args.len() > 3 {
+		eprintln!("Usage: inno_updater --recover <install root> [<exe name> [<mutex name>]]");
+		return Outcome::Error.code();
+	}
+
+	let product = env!("INNO_UPDATER_PRODUCT_NAME");
+	let root = PathBuf::from(&args[0]);
+	let exe = args
+		.get(1)
+		.filter(|s| !s.is_empty())
+		.cloned()
+		.unwrap_or_else(|| format!("{}.exe", product));
+	let mutex = args
+		.get(2)
+		.filter(|s| !s.is_empty())
+		.cloned()
+		.unwrap_or_else(|| product.to_lowercase().replace(' ', ""));
+
+	let file = match fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(true)
+		.open(log_path)
+	{
+		Ok(file) => file,
+		Err(err) => {
+			eprintln!("Could not open the log file {:?}: {}", log_path, err);
+			return Outcome::Error.code();
+		}
+	};
+
+	let decorator = slog_term::PlainDecorator::new(file);
+	let drain = slog_term::FullFormat::new(decorator).build().fuse();
+	// With the guard, dropping it flushes the log before the process exits.
+	let (drain, guard) = slog_async::Async::new(drain).build_with_guard();
+	let log = slog::Logger::root(drain.fuse(), o!());
+
+	let bad_argument = if !root.is_absolute() {
+		Some(format!("the install root must be absolute, got {:?}", root))
+	} else if exe.contains('\\') || exe.contains('/') {
+		Some(format!("the exe name must be a file name, got {:?}", exe))
+	} else {
+		None
+	};
+	let (outcome, reason) = match bad_argument {
+		Some(reason) => {
+			error!(log, "recover: {}", reason);
+			(Outcome::Error, reason)
+		}
+		None => repair::run(&log, &root, &exe, &mutex),
+	};
+
+	println!("recover: {} ({}): {}", outcome.label(), outcome.code(), reason);
+	println!("log: {}", log_path.display());
+
+	drop(log);
+	drop(guard);
+	outcome.code()
+}
+
 fn main() {
 	let args: Vec<String> = env::args().collect();
 	let mut log_path = env::temp_dir();
@@ -1738,6 +1804,14 @@ fn main() {
 		handle_error(log_path.to_str().unwrap());
 	} else if args.len() == 2 && args[1] == "--crash" {
 		panic!("Simulated crash");
+	} else if args.len() == 2 && args[1] == "--capabilities" {
+		// Side-effect free: no log file, no window. A helper that predates this prints
+		// "Bad usage" to stderr and exits 1 instead.
+		for capability in recover::CAPABILITIES {
+			println!("{}", capability);
+		}
+	} else if args.len() >= 2 && args[1] == "--recover" {
+		std::process::exit(recover_main(&args[2..], &log_path));
 	} else if args.len() == 2 && (args[1] == "--version" || args[1] == "-v") {
 		eprintln!("Inno Update v{}", VERSION);
 	} else {
